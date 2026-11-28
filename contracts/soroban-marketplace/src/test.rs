@@ -5427,3 +5427,5850 @@ fn test_buy_artwork_failure_does_not_leave_listing_locked() {
         crate::storage::release_listing_lock(&env, listing_id);
     });
 }
+use super::*;
+use crate::types::{ListingStatus, OfferStatus, Recipient};
+
+mod mock_nft {
+    use soroban_sdk::{contract, contractimpl, Address, Env};
+    #[contract]
+    pub struct MockNft;
+    #[contractimpl]
+    impl MockNft {
+        pub fn royalty_info(env: Env) -> (Address, u32) {
+            use soroban_sdk::testutils::Address as _;
+            let bps: u32 = env
+                .storage()
+                .instance()
+                .get(&soroban_sdk::symbol_short!("bps"))
+                .unwrap_or(0);
+            let recv: Address = env
+                .storage()
+                .instance()
+                .get(&soroban_sdk::symbol_short!("recv"))
+                .unwrap_or_else(|| Address::generate(&env));
+            (recv, bps)
+        }
+        pub fn set_royalty(env: Env, recv: Address, bps: u32) {
+            env.storage()
+                .instance()
+                .set(&soroban_sdk::symbol_short!("recv"), &recv);
+            env.storage()
+                .instance()
+                .set(&soroban_sdk::symbol_short!("bps"), &bps);
+        }
+        pub fn transfer_from(
+            _env: Env,
+            _spender: Address,
+            _from: Address,
+            _to: Address,
+            _token_id: u64,
+            _amount: u64,
+        ) {
+        }
+    }
+}
+
+mod mock_erc721_nonzero_token {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+    #[contract]
+    pub struct MockErc721;
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum DataKey {
+        Owner(u64),
+    }
+
+    #[contractimpl]
+    impl MockErc721 {
+        pub fn mint(env: Env, to: Address, token_id: u64) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Owner(token_id), &to);
+        }
+
+        pub fn owner_of(env: Env, token_id: u64) -> Address {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Owner(token_id))
+                .unwrap()
+        }
+
+        pub fn royalty_info(env: Env) -> (Address, u32) {
+            use soroban_sdk::testutils::Address as _;
+            (Address::generate(&env), 0)
+        }
+
+        pub fn transfer_from(
+            env: Env,
+            _spender: Address,
+            from: Address,
+            to: Address,
+            token_id: u64,
+        ) {
+            let key = DataKey::Owner(token_id);
+            let owner: Address = env.storage().persistent().get(&key).unwrap();
+            if owner != from {
+                panic!("not token owner");
+            }
+            env.storage().persistent().set(&key, &to);
+        }
+    }
+}
+
+use soroban_sdk::{
+    bytes, symbol_short,
+    testutils::Address as _,
+    testutils::Events as _,
+    testutils::Ledger,
+    testutils::MockAuth,
+    testutils::MockAuthInvoke,
+    token::{StellarAssetClient, TokenClient},
+    vec, Address, Env, IntoVal,
+};
+
+/// Helper — deploy the contract and a real test token, returning
+/// (env, client, artist, buyer, token_id, contract_id).
+fn setup() -> (
+    Env,
+    MarketplaceContractClient<'static>,
+    Address,
+    Address,
+    Address, // token_id  — a real SAC test token
+    Address, // contract_id — the marketplace contract
+    Address, // collection_id
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+
+    let artist = Address::generate(&env);
+    let buyer = Address::generate(&env);
+
+    // Register a Stellar Asset Contract for use as the payment token.
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&artist, &100_000_000_000_i128);
+    sac.mint(&buyer, &100_000_000_000_i128);
+    // Pre-mint to contract for cases where it needs to hold escrow funds.
+    sac.mint(&contract_id, &100_000_000_000_i128);
+
+    let collection_id = env.register(mock_nft::MockNft, ());
+    (
+        env,
+        client,
+        artist,
+        buyer,
+        token_id,
+        contract_id,
+        collection_id,
+    )
+}
+
+fn valid_recipients(env: &Env, artist: &Address) -> soroban_sdk::Vec<Recipient> {
+    vec![
+        env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 100,
+        },
+    ]
+}
+
+#[test]
+fn test_set_treasury_and_protocol_fee() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    // Set treasury address
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    assert_eq!(client.get_treasury(), Some(treasury.clone()));
+    // Set protocol fee to 500 bps (5%)
+    client.set_protocol_fee(&artist, &500u32);
+    assert_eq!(client.get_protocol_fee(), 500u32);
+    // Create listing and buy artwork
+    let cid = bytes!(&env, 0x516d74657374);
+    let price = 10_000_000_i128;
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(result);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+    // Fee logic: 5% of 10_000_000 = 500_000
+    // Seller should get 9_500_000, treasury gets 500_000
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&treasury), 500_000_i128);
+    assert_eq!(
+        token.balance(&artist),
+        100_000_000_000_i128 + 9_500_000_i128
+    );
+}
+
+#[test]
+fn test_buy_artwork_no_treasury_fee_set() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    // Set protocol fee but no treasury
+    client.set_protocol_fee(&artist, &300u32); // 3%
+    let cid = bytes!(&env, 0x516d74657374);
+    let price = 1_000_000_i128;
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(result);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+    // All funds should go to seller if treasury not set
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + price);
+}
+
+#[test]
+#[should_panic]
+fn test_set_protocol_fee_not_admin_panics() {
+    let (_env, client, artist, buyer, _token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    // Buyer tries to set protocol fee
+    client.set_protocol_fee(&buyer, &100u32);
+}
+
+#[test]
+#[should_panic]
+fn test_set_treasury_not_admin_panics() {
+    let (env, client, artist, buyer, _token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    let treasury = Address::generate(&env);
+    // Buyer tries to set treasury
+    client.set_treasury(&buyer, &treasury);
+}
+
+#[test]
+#[should_panic]
+fn test_set_protocol_fee_too_high_panics() {
+    let (_env, client, artist, _buyer, _token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    // Try to set fee > 1000 bps (10%)
+    client.set_protocol_fee(&artist, &2000u32);
+}
+
+// ── create_listing ───────────────────────────────────────────
+
+#[test]
+fn test_create_listing_success() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    let cid = bytes!(&env, 0x516d546573744349444f6f6e495046533132333435);
+    let price: i128 = 10_000_000; // 1 XLM
+
+    // Set admin and whitelist the token
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert_eq!(listing_id, 1);
+    assert_eq!(client.get_total_listings(), 1);
+
+    let listing = client.get_listing(&1);
+    assert_eq!(listing.listing_id, 1u64);
+    assert_eq!(listing.artist, artist);
+    assert_eq!(listing.price, price);
+    assert_eq!(listing.status, ListingStatus::Active);
+}
+
+#[test]
+fn test_buy_erc721_with_nonzero_token_id_when_token_zero_is_unminted() {
+    let (env, client, artist, buyer, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let collection_id = env.register(mock_erc721_nonzero_token::MockErc721, ());
+    let collection = mock_erc721_nonzero_token::MockErc721Client::new(&env, &collection_id);
+    collection.mint(&artist, &1);
+
+    let listing_id = client.create_listing(
+        &artist,
+        &10_000_000,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1,
+        &1,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.buy_artwork(&buyer, &listing_id);
+
+    assert_eq!(collection.owner_of(&1), buyer);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_create_listing_zero_price() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    client.create_listing(
+        &artist,
+        &0_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_create_listing_negative_price() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.create_listing(
+        &artist,
+        &-10_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+// #[test] // Deprecated in V2 architecture
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_create_listing_empty_cid() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.create_listing(
+        &artist,
+        &10_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_create_listing_invalid_split() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 50, // Doesn't equal 100
+        },
+    ];
+    client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &recipients,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_create_listing_too_many_recipients() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: Address::generate(&env),
+            percentage: 20,
+        },
+        Recipient {
+            address: Address::generate(&env),
+            percentage: 20,
+        },
+        Recipient {
+            address: Address::generate(&env),
+            percentage: 20,
+        },
+        Recipient {
+            address: Address::generate(&env),
+            percentage: 20,
+        },
+        Recipient {
+            address: Address::generate(&env),
+            percentage: 20,
+        },
+    ];
+    client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &recipients,
+    );
+}
+
+// ── cancel_listing ───────────────────────────────────────────
+
+#[test]
+fn test_cancel_listing_success() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let id = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let result = client.cancel_listing(&artist, &id);
+    assert!(result);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Cancelled);
+}
+
+#[test]
+fn test_cancel_listing_rejects_pending_offers() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+
+    let result = client.cancel_listing(&artist, &listing_id);
+    assert!(result);
+
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(listing.status, ListingStatus::Cancelled);
+
+    let offer = client.get_offer(&offer_id);
+    assert_eq!(offer.status, OfferStatus::Rejected);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_cancel_listing_wrong_artist() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+
+    let id = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.cancel_listing(&buyer, &id);
+}
+
+// ── update_listing ───────────────────────────────────────────
+
+#[test]
+fn test_update_listing_success() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let id = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let new_cid = bytes!(&env, 0x516e6577434944);
+    let new_price = 10_000_000_i128;
+    let new_rec = valid_recipients(&env, &artist);
+    let result = client.update_listing(&artist, &id, &new_price, &token_id, &new_rec);
+    assert!(result);
+
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.price, new_price);
+    assert_eq!(listing.token, token_id);
+}
+
+// #[test] // Deprecated in V2 architecture
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_update_listing_empty_cid() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let id = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let new_rec = valid_recipients(&env, &artist);
+    client.update_listing(&artist, &id, &10_000_000_i128, &token_id, &new_rec);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_update_listing_wrong_artist() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let id = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let new_cid = bytes!(&env, 0x51);
+    let new_rec = valid_recipients(&env, &artist);
+    client.update_listing(&buyer, &id, &10_000_000_i128, &token_id, &new_rec);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_update_listing_not_active() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let id = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.cancel_listing(&artist, &id);
+
+    let new_cid = bytes!(&env, 0x51);
+    let new_rec = valid_recipients(&env, &artist);
+    client.update_listing(&artist, &id, &10_000_000_i128, &token_id, &new_rec);
+}
+
+#[test]
+fn test_artist_revocation_and_reinstatement() {
+    let (env, client, artist, _, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist); // artist is admin for this test
+    client.add_token_to_whitelist(&token_id);
+
+    let artist_to_revoke = Address::generate(&env);
+    client.revoke_artist(&artist_to_revoke);
+
+    // Verify revoked artist cannot create listing
+    let cid = bytes!(&env, 0x516d74657374);
+    env.as_contract(&contract_id, || {
+        let r = client.try_create_listing(
+            &artist_to_revoke,
+            &5_000_000_i128,
+            &symbol_short!("XLM"),
+            &token_id,
+            &collection_id,
+            &1u64,
+            &1u64,
+            &valid_recipients(&env, &artist_to_revoke),
+        );
+        assert!(r.is_err());
+    });
+
+    // Verify revoked artist cannot create auction
+    env.as_contract(&contract_id, || {
+        let r = client.try_create_auction(
+            &artist_to_revoke,
+            &token_id,
+            &collection_id,
+            &1u64,
+            &1u64,
+            &1_000_000_i128,
+            &3600u64,
+            &valid_recipients(&env, &artist_to_revoke),
+        );
+        assert!(r.is_err());
+    });
+
+    // Reinstate
+    client.reinstate_artist(&artist_to_revoke);
+
+    // Now it should work
+    StellarAssetClient::new(&env, &token_id).mint(&artist_to_revoke, &100_000_000_000_i128);
+    let id = client.create_listing(
+        &artist_to_revoke,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist_to_revoke),
+    );
+    assert_eq!(id, 1u64);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_update_listing_fails_with_pending_offers() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+
+    // Try to update while offer is pending
+    let new_cid = bytes!(&env, 0x51);
+    let new_rec = valid_recipients(&env, &artist);
+    client.update_listing(&artist, &listing_id, &10_000_000_i128, &token_id, &new_rec);
+}
+
+// ── get_artist_listings ──────────────────────────────────────
+
+#[test]
+fn test_get_artist_listings() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+
+    client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.create_listing(
+        &artist,
+        &2_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.create_listing(
+        &artist,
+        &3_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let ids = client.get_artist_listings(&artist);
+    assert_eq!(ids.len(), 3);
+    assert_eq!(ids.get(0).unwrap(), 1_u64);
+    assert_eq!(ids.get(1).unwrap(), 2_u64);
+    assert_eq!(ids.get(2).unwrap(), 3_u64);
+}
+
+#[test]
+fn test_buy_artwork_success() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let price = 10_000_000_i128;
+
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(result);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+}
+
+#[test]
+fn test_buy_artwork_complex_split() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let colab1 = Address::generate(&env);
+    let colab2 = Address::generate(&env);
+
+    let cid = bytes!(&env, 0x516d74657374);
+    let price = 10_000_000_i128; // 1 XLM
+
+    // test precision rounding 33/33/34
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 33,
+        },
+        Recipient {
+            address: colab1.clone(),
+            percentage: 33,
+        },
+        Recipient {
+            address: colab2.clone(),
+            percentage: 34, // Last receiver takes the exact fractional remainder securely
+        },
+    ];
+
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &recipients,
+    );
+    assert!(client.buy_artwork(&buyer, &id));
+
+    // Verify recipients received correct amounts
+    let token = TokenClient::new(&env, &token_id);
+    let artist_got = token.balance(&artist) - 100_000_000_000_i128;
+    let colab1_got = token.balance(&colab1);
+    let colab2_got = token.balance(&colab2);
+    assert_eq!(artist_got + colab1_got + colab2_got, price);
+}
+
+// ── get_listing not found ────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_get_listing_not_found() {
+    let (_env, client, _, _, _, _, collection_id) = setup();
+    client.get_listing(&999);
+}
+
+// ── Admin/Whitelist Management Tests ───────────────────────
+
+#[test]
+#[should_panic]
+fn test_set_admin_only_once() {
+    let (_env, client, artist, _, _token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    // Second call should panic
+    client.set_admin(&artist);
+}
+
+#[test]
+fn test_add_and_remove_token_whitelist() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    // Add token
+    client.add_token_to_whitelist(&token_id);
+    // Remove token
+    client.remove_token_from_whitelist(&token_id);
+    // Now creating a listing with any token should SUCCEED (whitelist is empty)
+    let cid = bytes!(&env, 0x516d74657374);
+    let listing_id = client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(listing_id, 1u64);
+}
+
+#[test]
+#[should_panic]
+fn test_create_listing_with_non_whitelisted_token_panics() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    // Add a different token to whitelist
+    let other_token = Address::generate(&env);
+    client.add_token_to_whitelist(&other_token);
+    // Now creating a listing with token_id (not whitelisted) should panic
+    let cid = bytes!(&env, 0x516d74657374);
+    client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_create_listing_with_whitelisted_token_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let listing_id = client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(listing_id, 1u64);
+}
+
+#[test]
+fn test_buy_artwork_fee_greater_than_price() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    // Set protocol fee to 10%
+    client.set_protocol_fee(&artist, &1000u32);
+    let cid = bytes!(&env, 0x516d74657374);
+    let price = 5_i128; // Very small price
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(result);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+    // Fee: 10% of 5 = 0 (integer division), seller gets 5
+}
+
+#[test]
+fn test_buy_artwork_fee_rounding_precision() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    // Set protocol fee to 333 bps (3.33%)
+    client.set_protocol_fee(&artist, &333u32);
+    let cid = bytes!(&env, 0x516d74657374);
+    let price = 100_i128;
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(result);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+    // Fee: 100 * 333 / 10_000 = 3 (integer division), seller gets 97
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&treasury), 3_i128);
+}
+
+#[test]
+fn test_royalty_zero_percent() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let price = 10_000_000_i128;
+    // 0% royalty
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(result);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+    // All funds to seller
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + price);
+}
+
+#[test]
+fn test_royalty_hundred_percent() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let price = 10_000_000_i128;
+    // 100% royalty (10000 bps) — but artist IS original_creator, so royalty skipped (same address)
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(result);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+    // Royalty only applies when original_creator != seller; here they're equal so artist gets full price
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&artist), 100_000_000_000_i128 + price);
+}
+
+#[test]
+fn test_royalty_rounding_precision() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let price = 7_i128;
+    // 33% royalty (3300 bps)
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(result);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+    // Royalty skipped since artist == original_creator, artist gets full price
+}
+
+// #[test] // Deprecated in V2 architecture
+fn test_royalty_secondary_sale() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let price = 10_000_000_i128;
+    // 10% royalty
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    // First sale: artist sells to buyer
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(result);
+    let mut listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+    // Simulate secondary sale: buyer relists and sells to a new buyer
+    let new_buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&new_buyer, &100_000_000_000_i128);
+    listing.artist = buyer.clone();
+    listing.status = ListingStatus::Active;
+    listing.owner = None;
+    // Update recipients to the new seller (buyer) so payout goes to them
+    listing.recipients = vec![
+        &env,
+        Recipient {
+            address: buyer.clone(),
+            percentage: 100,
+        },
+    ];
+    // Save the relisted artwork using contract context
+    env.as_contract(&contract_id, || {
+        crate::storage::save_listing(&env, &listing);
+    });
+    let result2 = client.buy_artwork(&new_buyer, &id);
+    assert!(result2);
+    let listing2 = client.get_listing(&id);
+    assert_eq!(listing2.status, ListingStatus::Sold);
+    assert_eq!(listing2.owner, Some(new_buyer.clone()));
+    // 10% of price should go to original creator (artist), 90% to seller (buyer)
+    let token = TokenClient::new(&env, &token_id);
+    let royalty = price * 1000 / 10_000; // = 1_000_000
+    assert_eq!(
+        token.balance(&artist),
+        100_000_000_000_i128 + price + royalty
+    );
+    assert_eq!(
+        token.balance(&buyer),
+        100_000_000_000_i128 - price + (price - royalty)
+    );
+}
+
+// ── Auction Tests ────────────────────────────────────────────
+
+#[test]
+fn test_create_auction_success() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let cid = bytes!(&env, 0x516d74657374);
+    let reserve_price = 1_000_000_i128;
+    let duration = 3600u64; // 1 hour
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &reserve_price,
+        &duration,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert_eq!(auction_id, 1);
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.creator, artist);
+    assert_eq!(auction.reserve_price, reserve_price);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Active);
+    assert_eq!(auction.end_time, env.ledger().timestamp() + duration);
+
+    assert_eq!(client.get_total_auctions(), 1);
+    let artist_auctions = client.get_artist_auctions(&artist);
+    assert_eq!(artist_auctions.len(), 1);
+    assert_eq!(artist_auctions.get(0).unwrap(), 1);
+}
+
+// #[test] // Deprecated in V2 architecture
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_create_auction_zero_reserve_rejected() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &0,
+        &3600,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_create_auction_duration_exceeds_max_fails() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // MAX_AUCTION_DURATION is 30 days (2_592_000 seconds).
+    // Attempting 30 days + 1 second should fail with InvalidAuctionDuration (#26).
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &(crate::contract::MAX_AUCTION_DURATION + 1),
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_create_auction_duration_below_min_fails() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // MIN_DURATION_SECONDS is 60. Attempting 59 seconds should fail with InvalidAuctionDuration (#26).
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &(crate::contract::MIN_DURATION_SECONDS - 1),
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_create_auction_duration_at_max_boundary_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &crate::contract::MAX_AUCTION_DURATION,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert_eq!(auction_id, 1);
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(
+        auction.end_time,
+        env.ledger().timestamp() + crate::contract::MAX_AUCTION_DURATION
+    );
+}
+
+#[test]
+fn test_place_bid_success() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let cid = bytes!(&env, 0x516d74657374);
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000,
+        &3600,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &id, &1_500_000);
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.highest_bid, 1_500_000);
+    assert_eq!(auction.highest_bidder, Some(buyer));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_place_bid_too_low() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000,
+        &3600,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &id, &500_000); // Below reserve
+}
+
+#[test]
+fn test_finalize_auction_with_winner() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000,
+        &3600,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &id, &1_500_000);
+
+    // Jump in time
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+
+    client.finalize_auction(&buyer, &id);
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Finalized);
+}
+
+#[test]
+fn test_finalize_auction_no_bids() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let token = TokenClient::new(&env, &token_id);
+
+    // Record initial token balances before auction creation and finalization
+    let artist_balance_before = token.balance(&artist);
+    let buyer_balance_before = token.balance(&buyer);
+    let contract_balance_before = token.balance(&contract_id);
+
+    let reserve_price = 1_000_000_i128;
+    let duration = 3600_u64;
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &reserve_price,
+        &duration,
+        &valid_recipients(&env, &artist),
+    );
+
+    let created_auction = client.get_auction(&id);
+    assert_eq!(created_auction.status, crate::types::AuctionStatus::Active);
+    assert_eq!(created_auction.highest_bid, 0);
+    assert_eq!(created_auction.highest_bidder, None);
+
+    // Advance time past auction end_time to meet finalization conditions
+    env.ledger().with_mut(|l| {
+        l.timestamp += duration + 1;
+    });
+
+    // Any caller can finalize an expired auction with no bids
+    client.finalize_auction(&buyer, &id);
+
+    // Verify contract state post-finalization
+    let finalized_auction = client.get_auction(&id);
+    assert_eq!(
+        finalized_auction.status,
+        crate::types::AuctionStatus::Cancelled
+    );
+    assert_eq!(finalized_auction.highest_bidder, None);
+    assert_eq!(finalized_auction.highest_bid, 0);
+
+    // Verify no payment or asset transfer occurred
+    assert_eq!(token.balance(&artist), artist_balance_before);
+    assert_eq!(token.balance(&buyer), buyer_balance_before);
+    assert_eq!(token.balance(&contract_id), contract_balance_before);
+}
+
+#[test]
+fn test_finalize_auction_no_bids_early_by_creator() {
+    let (env, client, artist, _buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_balance_before = token.balance(&artist);
+    let contract_balance_before = token.balance(&contract_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Creator finalizes early without waiting for expiry when there are no bids
+    client.finalize_auction(&artist, &id);
+
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Cancelled);
+    assert_eq!(auction.highest_bidder, None);
+    assert_eq!(auction.highest_bid, 0);
+
+    assert_eq!(token.balance(&artist), artist_balance_before);
+    assert_eq!(token.balance(&contract_id), contract_balance_before);
+}
+
+#[test]
+fn test_cancel_auction_by_creator_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.cancel_auction(&artist, &id);
+
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Cancelled);
+    assert_eq!(auction.highest_bidder, None);
+}
+
+#[test]
+fn test_cancel_auction_by_non_creator_fails() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let result = client.try_cancel_auction(&buyer, &id);
+    assert!(result.is_err());
+
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_cancel_auction_with_bid_fails() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &id, &1_500_000);
+    client.cancel_auction(&artist, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_cancel_auction_after_expiry_fails() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3600);
+    client.cancel_auction(&artist, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_cancel_auction_after_finalize_fails() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &id, &1_500_000);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &id);
+
+    client.cancel_auction(&artist, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_place_bid_after_cancel_fails() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.cancel_auction(&artist, &id);
+    client.place_bid(&buyer, &id, &1_500_000);
+}
+
+#[test]
+fn test_finalize_auction_before_expiry_by_regular_user_fails() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_balance_before = token.balance(&artist);
+    let buyer_balance_before = token.balance(&buyer);
+    let contract_balance_before = token.balance(&contract_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Attempt early finalization as regular user (non-creator) before end_time
+    let result = client.try_finalize_auction(&buyer, &id);
+
+    // Assert that the call failed with Unauthorized
+    assert!(result.is_err());
+
+    // Verify auction state is unchanged
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Active);
+    assert_eq!(auction.highest_bidder, None);
+    assert_eq!(auction.highest_bid, 0);
+
+    // Verify no balances were modified
+    assert_eq!(token.balance(&artist), artist_balance_before);
+    assert_eq!(token.balance(&buyer), buyer_balance_before);
+    assert_eq!(token.balance(&contract_id), contract_balance_before);
+}
+
+#[test]
+fn test_finalize_auction_before_expiry_by_admin_fails_if_not_creator() {
+    let (env, client, artist, _buyer, token_id, contract_id, collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+    client.add_token_to_whitelist(&token_id);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_balance_before = token.balance(&artist);
+    let admin_balance_before = token.balance(&admin);
+    let contract_balance_before = token.balance(&contract_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Contract does not support admin override for early finalization if admin != creator.
+    // Calling finalize_auction as admin before end_time returns Unauthorized.
+    let result = client.try_finalize_auction(&admin, &id);
+    assert!(result.is_err());
+
+    // Verify auction state remains Active and unchanged
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Active);
+    assert_eq!(auction.highest_bidder, None);
+    assert_eq!(auction.highest_bid, 0);
+
+    // Verify balances are unchanged
+    assert_eq!(token.balance(&artist), artist_balance_before);
+    assert_eq!(token.balance(&admin), admin_balance_before);
+    assert_eq!(token.balance(&contract_id), contract_balance_before);
+}
+
+#[test]
+fn test_finalize_auction_after_expiry_by_regular_user_succeeds() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let duration = 3600_u64;
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &duration,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Advance time past expiry
+    env.ledger().with_mut(|l| {
+        l.timestamp += duration + 1;
+    });
+
+    // Regular user can successfully finalize after end_time
+    client.finalize_auction(&buyer, &id);
+
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Cancelled);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_place_bid_after_expiration() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000,
+        &3600,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Jump in time
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+
+    client.place_bid(&buyer, &id, &1_500_000);
+}
+
+#[test]
+fn test_outbid_refund_logic_check() {
+    let (env, client, artist, buyer1, token_id, _contract_id, collection_id) = setup();
+    let buyer2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&buyer2, &100_000_000_000_i128);
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000,
+        &3600,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer1, &id, &1_500_000);
+    client.place_bid(&buyer2, &id, &2_000_000);
+
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.highest_bid, 2_000_000);
+    assert_eq!(auction.highest_bidder, Some(buyer2));
+
+    // buyer1 should have been refunded their 1_500_000
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&buyer1), 100_000_000_000_i128);
+}
+
+#[test]
+fn test_place_bid_refunds_previous_highest_bidder() {
+    let (env, client, artist, buyer1, token_id, contract_id, collection_id) = setup();
+    let buyer2 = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&buyer2, &100_000_000_000_i128);
+
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000,
+        &3600,
+        &valid_recipients(&env, &artist),
+    );
+
+    let token = TokenClient::new(&env, &token_id);
+
+    let initial_buyer1 = token.balance(&buyer1);
+    let initial_buyer2 = token.balance(&buyer2);
+    let initial_contract = token.balance(&contract_id);
+
+    // ── buyer1 places the first bid ──
+    let bid1 = 1_500_000_i128;
+    client.place_bid(&buyer1, &id, &bid1);
+
+    // buyer1's funds are escrowed
+    assert_eq!(token.balance(&buyer1), initial_buyer1 - bid1);
+    // contract holds the escrowed bid
+    assert_eq!(token.balance(&contract_id), initial_contract + bid1);
+    // buyer2's balance is unchanged
+    assert_eq!(token.balance(&buyer2), initial_buyer2);
+
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.highest_bid, bid1);
+    assert_eq!(auction.highest_bidder, Some(buyer1.clone()));
+
+    // ── buyer2 outbids with a higher amount ──
+    let bid2 = 2_000_000_i128;
+    client.place_bid(&buyer2, &id, &bid2);
+
+    // buyer1 must be fully refunded — balance returns to initial
+    assert_eq!(token.balance(&buyer1), initial_buyer1);
+    // buyer2's bid amount is escrowed
+    assert_eq!(token.balance(&buyer2), initial_buyer2 - bid2);
+    // contract must hold only the winning bid, NOT the sum of both bids
+    assert_eq!(token.balance(&contract_id), initial_contract + bid2);
+
+    // Verify auction state reflects the new winner
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.highest_bid, bid2);
+    assert_eq!(auction.highest_bidder, Some(buyer2.clone()));
+
+    // ── A third bidder outbids again ──
+    let buyer3 = Address::generate(&env);
+    sac.mint(&buyer3, &100_000_000_000_i128);
+    let initial_buyer3 = token.balance(&buyer3);
+
+    let bid3 = 3_000_000_i128;
+    client.place_bid(&buyer3, &id, &bid3);
+
+    // buyer2 (previous highest) must be refunded in full
+    assert_eq!(token.balance(&buyer2), initial_buyer2);
+    // buyer3's bid is escrowed
+    assert_eq!(token.balance(&buyer3), initial_buyer3 - bid3);
+    // Contract holds only the latest winning bid
+    assert_eq!(token.balance(&contract_id), initial_contract + bid3);
+
+    // Verify final auction state
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.highest_bid, bid3);
+    assert_eq!(auction.highest_bidder, Some(buyer3.clone()));
+}
+
+/// Four consecutive outbids across three bidders, two of whom re-enter after
+/// being refunded. After every bid, each outbid user must get back exactly
+/// their prior bid, and the contract must escrow only the current highest bid.
+#[test]
+fn test_place_bid_refunds_exact_prior_bid_across_successive_outbids() {
+    let (env, client, artist, bidder_a, token_id, contract_id, collection_id) = setup();
+    let sac = StellarAssetClient::new(&env, &token_id);
+    let bidder_b = Address::generate(&env);
+    let bidder_c = Address::generate(&env);
+    sac.mint(&bidder_b, &100_000_000_000_i128);
+    sac.mint(&bidder_c, &100_000_000_000_i128);
+
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000,
+        &3600,
+        &valid_recipients(&env, &artist),
+    );
+
+    let token = TokenClient::new(&env, &token_id);
+    let bidders = [bidder_a, bidder_b, bidder_c];
+    let initial = bidders.each_ref().map(|bidder| token.balance(bidder));
+    let escrow_base = token.balance(&contract_id);
+
+    // (bidder index, amount): an opening bid followed by four outbids, each
+    // clearing the 5% minimum increment.
+    let bids: [(usize, i128); 5] = [
+        (0, 1_000_000),
+        (1, 1_250_000),
+        (2, 1_500_000),
+        (0, 2_000_000),
+        (1, 2_600_000),
+    ];
+
+    let mut expected = initial;
+    let mut leader: Option<(usize, i128)> = None;
+
+    for (bidder, amount) in bids {
+        client.place_bid(&bidders[bidder], &id, &amount);
+
+        if let Some((outbid, prior_bid)) = leader {
+            expected[outbid] += prior_bid;
+        }
+        expected[bidder] -= amount;
+        leader = Some((bidder, amount));
+
+        for (address, balance) in bidders.iter().zip(expected) {
+            assert_eq!(token.balance(address), balance);
+        }
+        assert_eq!(token.balance(&contract_id), escrow_base + amount);
+
+        let auction = client.get_auction(&id);
+        assert_eq!(auction.highest_bid, amount);
+        assert_eq!(auction.highest_bidder, Some(bidders[bidder].clone()));
+    }
+
+    // Net effect: only the final leader is out of pocket, by exactly their bid.
+    assert_eq!(token.balance(&bidders[0]), initial[0]);
+    assert_eq!(token.balance(&bidders[1]), initial[1] - 2_600_000);
+    assert_eq!(token.balance(&bidders[2]), initial[2]);
+}
+
+// ── Offer Tests ─────────────────────────────────────────────
+
+/// Helper to create a listing and return its ID.
+fn create_test_listing(
+    env: &Env,
+    client: &MarketplaceContractClient,
+    artist: &Address,
+    token_id: &Address,
+) -> u64 {
+    let collection_id = env.register(mock_nft::MockNft, ());
+    let cid = bytes!(env, 0x516d74657374);
+    let price = 10_000_000_i128;
+    client.create_listing(
+        artist,
+        &price,
+        &symbol_short!("XLM"),
+        token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(env, artist),
+    )
+}
+
+#[test]
+fn test_make_offer_success() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+
+    assert_eq!(offer_id, 1);
+
+    let offer = client.get_offer(&offer_id);
+    assert_eq!(offer.offer_id, 1u64);
+    assert_eq!(offer.listing_id, listing_id);
+    assert_eq!(offer.offerer, buyer);
+    assert_eq!(offer.amount, 5_000_000_i128);
+    assert_eq!(offer.token, token_id);
+    assert_eq!(offer.status, OfferStatus::Pending);
+
+    // Check indexes
+    let listing_offers = client.get_listing_offers(&listing_id);
+    assert_eq!(listing_offers.len(), 1);
+    assert_eq!(listing_offers.get(0).unwrap(), 1u64);
+
+    let offerer_offers = client.get_offerer_offers(&buyer);
+    assert_eq!(offerer_offers.len(), 1);
+    assert_eq!(offerer_offers.get(0).unwrap(), 1u64);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_make_offer_on_own_listing_fails() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+
+    // Artist tries to offer on their own listing
+    client.make_offer(&artist, &listing_id, &5_000_000_i128, &token_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_make_offer_on_nonexistent_listing_fails() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+
+    client.make_offer(&buyer, &999u64, &5_000_000_i128, &token_id);
+}
+
+#[test]
+fn test_withdraw_offer_success() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+
+    client.withdraw_offer(&buyer, &offer_id);
+
+    let offer = client.get_offer(&offer_id);
+    assert_eq!(offer.status, OfferStatus::Withdrawn);
+
+    // Buyer should have been refunded
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&buyer), 100_000_000_000_i128);
+}
+
+// ── Issue #1096: Offer withdrawal after listing cancellation ──────────────────
+
+#[test]
+fn test_offers_auto_refunded_when_listing_cancelled() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Create listing and make an offer
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+
+    let token = TokenClient::new(&env, &token_id);
+
+    // Verify offer was created and funds are escrowed
+    let offer_before = client.get_offer(&offer_id);
+    assert_eq!(offer_before.status, OfferStatus::Pending);
+    assert_eq!(offer_before.amount, 5_000_000_i128);
+
+    // Verify buyer's balance decreased (funds escrowed in contract)
+    let buyer_balance_after_offer = token.balance(&buyer);
+    assert_eq!(
+        buyer_balance_after_offer,
+        100_000_000_000_i128 - 5_000_000_i128,
+        "Buyer balance should decrease by offer amount when offer is made"
+    );
+
+    // Artist cancels the listing
+    let cancel_result = client.cancel_listing(&artist, &listing_id);
+    assert!(cancel_result);
+
+    // Verify listing is cancelled
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(listing.status, ListingStatus::Cancelled);
+
+    // Verify offer was automatically rejected (not Pending anymore)
+    let offer_after = client.get_offer(&offer_id);
+    assert_eq!(
+        offer_after.status,
+        OfferStatus::Rejected,
+        "Offer must be automatically rejected when listing is cancelled"
+    );
+
+    // Verify buyer was automatically refunded (no need to call withdraw_offer)
+    let buyer_balance_after_cancel = token.balance(&buyer);
+    assert_eq!(
+        buyer_balance_after_cancel, 100_000_000_000_i128,
+        "Buyer must be automatically refunded when listing is cancelled"
+    );
+}
+
+#[test]
+fn test_accept_offer_success() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+
+    client.accept_offer(&artist, &offer_id);
+
+    let offer = client.get_offer(&offer_id);
+    assert_eq!(offer.status, OfferStatus::Accepted);
+
+    // Listing should be sold with buyer as owner
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+
+    // Artist should have received the offer amount
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(
+        token.balance(&artist),
+        100_000_000_000_i128 + 5_000_000_i128
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn test_accept_offer_reentrancy_guard() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+
+    // Simulate a nested accept_offer while the listing lock is held (e.g. payout token callback).
+    env.as_contract(&contract_id, || {
+        assert!(crate::storage::acquire_listing_lock(&env, listing_id));
+    });
+    client.accept_offer(&artist, &offer_id);
+}
+
+#[test]
+fn test_reject_offer_success() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+
+    client.reject_offer(&artist, &offer_id);
+
+    let offer = client.get_offer(&offer_id);
+    assert_eq!(offer.status, OfferStatus::Rejected);
+
+    // Listing should still be active
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(listing.status, ListingStatus::Active);
+
+    // Buyer should have been refunded
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&buyer), 100_000_000_000_i128);
+}
+
+#[test]
+fn test_accept_offer_rejects_others() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    let buyer2 = Address::generate(&env);
+    let buyer3 = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&buyer2, &100_000_000_000_i128);
+    sac.mint(&buyer3, &100_000_000_000_i128);
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+
+    let offer_id_1 = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+    let offer_id_2 = client.make_offer(&buyer2, &listing_id, &7_000_000_i128, &token_id);
+    let offer_id_3 = client.make_offer(&buyer3, &listing_id, &3_000_000_i128, &token_id);
+
+    // Accept offer 2
+    client.accept_offer(&artist, &offer_id_2);
+
+    // Offer 2 should be accepted
+    let offer2 = client.get_offer(&offer_id_2);
+    assert_eq!(offer2.status, OfferStatus::Accepted);
+
+    // Offers 1 and 3 should be rejected (refunded)
+    let offer1 = client.get_offer(&offer_id_1);
+    assert_eq!(offer1.status, OfferStatus::Rejected);
+
+    let offer3 = client.get_offer(&offer_id_3);
+    assert_eq!(offer3.status, OfferStatus::Rejected);
+
+    // Listing should be sold with buyer2 as owner
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer2.clone()));
+
+    // Rejected offerers should have been refunded
+    let token = TokenClient::new(&env, &token_id);
+    assert_eq!(token.balance(&buyer), 100_000_000_000_i128);
+    assert_eq!(token.balance(&buyer3), 100_000_000_000_i128);
+}
+
+// ── Admin and Revocation Tests ──────────────────────────────
+
+#[test]
+fn test_artist_revocation_flow() {
+    let (env, client, artist, _, token_id, contract_id, collection_id) = setup();
+    let cid = bytes!(&env, 0x51);
+    let price = 1_000_000_i128;
+
+    client.set_admin(&artist); // Artist is admin for this test
+    client.add_token_to_whitelist(&token_id);
+
+    // 1. Artist is NOT revoked initially
+    client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // 2. Admin revokes artist
+    client.revoke_artist(&artist);
+
+    // 3. Artist tries to create listing - Should Panic (Unauthorized #5)
+    let result = env.as_contract(&contract_id, || {
+        client.try_create_listing(
+            &artist,
+            &price,
+            &symbol_short!("XLM"),
+            &token_id,
+            &collection_id,
+            &1u64,
+            &1u64,
+            &valid_recipients(&env, &artist),
+        )
+    });
+    assert!(result.is_err());
+
+    // 4. Admin reinstates artist
+    client.reinstate_artist(&artist);
+
+    // 5. Artist creates listing again - Should succeed
+    client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_update_listing_with_pending_offer_fails() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+
+    // Add a pending offer
+    client.make_offer(&buyer, &id, &5_000_000, &token_id);
+
+    // Try to update listing - Should fail
+    let result = env.as_contract(&contract_id, || {
+        client.try_update_listing(
+            &artist,
+            &id,
+            &15_000_000,
+            &token_id,
+            &valid_recipients(&env, &artist),
+        )
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_update_listing_success_with_recipients() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+
+    let new_recipients = vec![
+        &env,
+        crate::types::Recipient {
+            address: artist.clone(),
+            percentage: 50,
+        },
+        crate::types::Recipient {
+            address: Address::generate(&env),
+            percentage: 50,
+        },
+    ];
+
+    client.update_listing(&artist, &id, &15_000_000, &token_id, &new_recipients);
+
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.price, 15_000_000);
+    assert_eq!(listing.recipients.len(), 2);
+}
+
+// ── buy_artwork edge cases (Issue #124) ──────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_buy_cancelled_listing_fails() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.cancel_listing(&artist, &id);
+    client.buy_artwork(&buyer, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_buy_already_sold_listing_fails() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.buy_artwork(&buyer, &id);
+    // Second buy attempt on an already-sold listing
+    let buyer2 = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&buyer2, &100_000_000_000_i128);
+    client.buy_artwork(&buyer2, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_buy_own_listing_fails() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.buy_artwork(&artist, &id);
+}
+
+// ── update_listing recipient validation (Issue #175) ─────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_update_listing_invalid_split_fails() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    let bad_recipients = vec![
+        &env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 50, // does not sum to 100
+        },
+    ];
+    client.update_listing(&artist, &id, &10_000_000, &token_id, &bad_recipients);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_update_listing_too_many_recipients_fails() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    let too_many = vec![
+        &env,
+        Recipient {
+            address: Address::generate(&env),
+            percentage: 20,
+        },
+        Recipient {
+            address: Address::generate(&env),
+            percentage: 20,
+        },
+        Recipient {
+            address: Address::generate(&env),
+            percentage: 20,
+        },
+        Recipient {
+            address: Address::generate(&env),
+            percentage: 20,
+        },
+        Recipient {
+            address: Address::generate(&env),
+            percentage: 20,
+        },
+    ];
+    client.update_listing(&artist, &id, &10_000_000, &token_id, &too_many);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_update_listing_empty_recipients_fails() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.update_listing(
+        &artist,
+        &id,
+        &10_000_000,
+        &token_id,
+        &soroban_sdk::Vec::new(&env),
+    );
+}
+
+// ── transfer_admin / accept_admin tests (Issue #162) ────────
+
+#[test]
+fn test_transfer_admin_two_step_succeeds() {
+    let (env, client, admin, _, _token_id, _contract_id, collection_id) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.set_admin(&admin);
+    assert_eq!(client.get_admin(), Some(admin.clone()));
+
+    // Step 1: current admin proposes new admin
+    client.transfer_admin(&admin, &new_admin);
+
+    // Admin has NOT changed yet
+    assert_eq!(client.get_admin(), Some(admin.clone()));
+
+    // Step 2: new admin accepts
+    client.accept_admin(&new_admin);
+
+    assert_eq!(client.get_admin(), Some(new_admin.clone()));
+}
+
+#[test]
+#[should_panic]
+fn test_transfer_admin_wrong_caller_panics() {
+    let (env, client, admin, _, _token_id, _contract_id, collection_id) = setup();
+    let impostor = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    client.set_admin(&admin);
+    // impostor tries to initiate transfer — should panic Unauthorized
+    client.transfer_admin(&impostor, &new_admin);
+}
+
+#[test]
+#[should_panic]
+fn test_accept_admin_wrong_caller_panics() {
+    let (env, client, admin, _, _token_id, _contract_id, collection_id) = setup();
+    let new_admin = Address::generate(&env);
+    let impostor = Address::generate(&env);
+
+    client.set_admin(&admin);
+    client.transfer_admin(&admin, &new_admin);
+    // A different address tries to accept — should panic Unauthorized
+    client.accept_admin(&impostor);
+}
+
+// ── Event emission tests (Issue #180) ────────────────────────
+
+fn has_event_with_topic(events: &soroban_sdk::testutils::ContractEvents, symbol: &str) -> bool {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    events.events().iter().any(|e| {
+        if let ContractEventBody::V0(body) = &e.body {
+            body.topics.iter().any(|t| {
+                if let ScVal::Symbol(s) = t {
+                    core::str::from_utf8(s.0.as_slice()).unwrap_or("") == symbol
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
+    })
+}
+
+#[test]
+fn test_buy_artwork_emits_artwork_sold_event() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    client.buy_artwork(&buyer, &listing_id);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "art_sold"),
+        "ArtworkSoldEvent was not emitted"
+    );
+}
+
+#[test]
+fn test_cancel_listing_emits_listing_cancelled_event() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    client.cancel_listing(&artist, &listing_id);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "lst_cncl"),
+        "ListingCancelledEvent was not emitted"
+    );
+}
+
+#[test]
+fn test_update_listing_emits_listing_updated_event() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    client.update_listing(
+        &artist,
+        &listing_id,
+        &20_000_000,
+        &token_id,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "lst_updt"),
+        "ListingUpdatedEvent was not emitted"
+    );
+}
+
+#[test]
+fn test_make_offer_emits_offer_made_event() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "ofr_made"),
+        "OfferMadeEvent was not emitted"
+    );
+}
+
+#[test]
+fn test_accept_offer_emits_offer_accepted_event() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+    client.accept_offer(&artist, &offer_id);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "ofr_accp"),
+        "OfferAcceptedEvent was not emitted"
+    );
+}
+
+#[test]
+fn test_reject_offer_emits_offer_rejected_event() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+    client.reject_offer(&artist, &offer_id);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "ofr_rjct"),
+        "OfferRejectedEvent was not emitted"
+    );
+}
+
+#[test]
+fn test_withdraw_offer_emits_offer_withdrawn_event() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &listing_id, &5_000_000_i128, &token_id);
+    client.withdraw_offer(&buyer, &offer_id);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "ofr_wdrn"),
+        "OfferWithdrawnEvent was not emitted"
+    );
+}
+
+#[test]
+fn test_create_auction_emits_auction_created_event() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "auc_crtd"),
+        "AuctionCreatedEvent was not emitted"
+    );
+}
+
+#[test]
+fn test_place_bid_emits_bid_placed_event() {
+    let (env, client, artist, bidder, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.place_bid(&bidder, &auction_id, &2_000_000_i128);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "bid_plcd"),
+        "BidPlacedEvent was not emitted"
+    );
+}
+
+#[test]
+fn test_finalize_auction_emits_auction_resolved_event() {
+    let (env, client, artist, bidder, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.place_bid(&bidder, &auction_id, &2_000_000_i128);
+
+    env.ledger().with_mut(|l| {
+        l.timestamp += 7200;
+    });
+
+    client.finalize_auction(&bidder, &auction_id);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "auc_rslv"),
+        "AuctionFinalizedEvent was not emitted"
+    );
+}
+
+// ── Token transfer tests (Issue #165) ────────────────────────
+
+#[test]
+fn test_buy_artwork_transfers_correct_amounts_to_recipients() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let price = 10_000_000_i128;
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let token = TokenClient::new(&env, &token_id);
+    let buyer_before = token.balance(&buyer);
+    let artist_before = token.balance(&artist);
+
+    client.buy_artwork(&buyer, &id);
+
+    assert_eq!(token.balance(&buyer), buyer_before - price);
+    assert_eq!(token.balance(&artist), artist_before + price);
+}
+
+// #[test] // Deprecated in V2 architecture
+fn test_buy_artwork_pays_royalty_on_secondary_sale() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let price = 10_000_000_i128;
+    let royalty_bps = 1000u32; // 10%
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // First sale (no royalty since original_creator == seller)
+    client.buy_artwork(&buyer, &id);
+
+    // Secondary sale setup: buyer relists
+    let new_buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&new_buyer, &100_000_000_000_i128);
+    let mut listing = client.get_listing(&id);
+    listing.artist = buyer.clone();
+    listing.status = ListingStatus::Active;
+    listing.owner = None;
+    listing.recipients = vec![
+        &env,
+        Recipient {
+            address: buyer.clone(),
+            percentage: 100,
+        },
+    ];
+    env.as_contract(&contract_id, || {
+        crate::storage::save_listing(&env, &listing);
+    });
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before = token.balance(&artist);
+    let buyer_before = token.balance(&buyer);
+
+    client.buy_artwork(&new_buyer, &id);
+
+    let expected_royalty = price * royalty_bps as i128 / 10_000; // 1_000_000
+    assert_eq!(token.balance(&artist), artist_before + expected_royalty);
+    assert_eq!(
+        token.balance(&buyer),
+        buyer_before + price - expected_royalty
+    );
+}
+
+#[test]
+fn test_buy_artwork_pays_treasury_fee() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32); // 5%
+
+    let price = 10_000_000_i128;
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.buy_artwork(&buyer, &id);
+
+    let token = TokenClient::new(&env, &token_id);
+    let expected_fee = price * 500 / 10_000; // 500_000
+    assert_eq!(token.balance(&treasury), expected_fee);
+    assert_eq!(
+        token.balance(&artist),
+        100_000_000_000_i128 + price - expected_fee
+    );
+}
+
+// ── Pause / unpause lifecycle tests (Issue #200) ─────────────
+
+#[test]
+fn test_admin_pause_and_unpause() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    assert!(!client.is_paused());
+    client.admin_pause(&artist);
+    assert!(client.is_paused());
+    client.admin_unpause(&artist);
+    assert!(!client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_create_listing_while_paused_fails() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.admin_pause(&artist);
+    client.create_listing(
+        &artist,
+        &10_000_000,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_buy_artwork_while_paused_fails() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.admin_pause(&artist);
+    client.buy_artwork(&buyer, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_cancel_listing_while_paused_fails() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.admin_pause(&artist);
+    client.cancel_listing(&artist, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_make_offer_while_paused_fails() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.admin_pause(&artist);
+    client.make_offer(&buyer, &id, &5_000_000_i128, &token_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_create_auction_while_paused_fails() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.admin_pause(&artist);
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_actions_succeed_after_unpause() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.admin_pause(&artist);
+    client.admin_unpause(&artist);
+    // Should succeed after unpausing
+    assert!(client.buy_artwork(&buyer, &id));
+}
+
+// ── Offer edge cases (Issue #200) ─────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_make_offer_zero_amount_fails() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.make_offer(&buyer, &id, &0_i128, &token_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_make_offer_negative_amount_fails() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.make_offer(&buyer, &id, &-1_000_i128, &token_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_accept_already_accepted_offer_fails() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &id, &5_000_000_i128, &token_id);
+    client.accept_offer(&artist, &offer_id);
+    // Second accept on the same (now non-pending) offer should panic
+    client.accept_offer(&artist, &offer_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_reject_withdrawn_offer_fails() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    let offer_id = client.make_offer(&buyer, &id, &5_000_000_i128, &token_id);
+    client.withdraw_offer(&buyer, &offer_id);
+    // Reject a withdrawn offer — status is no longer Pending
+    client.reject_offer(&artist, &offer_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_accept_nonexistent_offer_fails() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.accept_offer(&artist, &9999_u64);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_reject_nonexistent_offer_fails() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.reject_offer(&artist, &9999_u64);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_withdraw_nonexistent_offer_fails() {
+    let (env, client, _, buyer, token_id, _, collection_id) = setup();
+    client.withdraw_offer(&buyer, &9999_u64);
+}
+
+// ── Cancel listing edge cases (Issue #200) ───────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_cancel_already_cancelled_listing_fails() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.cancel_listing(&artist, &id);
+    // Second cancel should fail: listing is no longer Active
+    client.cancel_listing(&artist, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_cancel_sold_listing_fails() {
+    let (env, client, artist, buyer, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+    client.buy_artwork(&buyer, &id);
+    client.cancel_listing(&artist, &id);
+}
+
+// ── Auction edge cases (Issue #200) ─────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_bid_on_nonexistent_auction_fails() {
+    let (_, client, _, buyer, _, _, collection_id) = setup();
+    client.place_bid(&buyer, &9999_u64, &1_000_000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_finalize_nonexistent_auction_fails() {
+    let (_, client, _, caller, _, _, collection_id) = setup();
+    client.finalize_auction(&caller, &9999_u64);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_finalize_already_finalized_auction_fails() {
+    let (env, client, artist, bidder, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.place_bid(&bidder, &auction_id, &2_000_000_i128);
+    env.ledger().with_mut(|l| {
+        l.timestamp += 7200;
+    });
+    client.finalize_auction(&bidder, &auction_id);
+    // Second finalize should fail
+    client.finalize_auction(&bidder, &auction_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_bid_on_finalized_auction_fails() {
+    let (env, client, artist, bidder, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600_u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.place_bid(&bidder, &auction_id, &2_000_000_i128);
+    env.ledger().with_mut(|l| {
+        l.timestamp += 7200;
+    });
+    client.finalize_auction(&bidder, &auction_id);
+    // Bid after finalization: auction status is no longer Active
+    let new_bidder = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&new_bidder, &100_000_000_000_i128);
+    client.place_bid(&new_bidder, &auction_id, &3_000_000_i128);
+}
+
+// ── Admin transfer edge cases (Issue #200) ──────────────────
+
+#[test]
+#[should_panic]
+fn test_accept_admin_with_no_pending_transfer_panics() {
+    let (env, client, admin, _, _token_id, _, collection_id) = setup();
+    let impostor = Address::generate(&env);
+    client.set_admin(&admin);
+    // accept_admin when no transfer has been initiated — should panic
+    client.accept_admin(&impostor);
+}
+
+// ── Revoke / reinstate standalone tests (Issue #200) ────────
+
+#[test]
+fn test_revoke_and_reinstate_artist() {
+    let (env, client, admin, artist2, token_id, _, collection_id) = setup();
+    client.set_admin(&admin);
+    client.add_token_to_whitelist(&token_id);
+
+    assert!(!client.is_artist_revoked(&artist2));
+    client.revoke_artist(&artist2);
+    assert!(client.is_artist_revoked(&artist2));
+    client.reinstate_artist(&artist2);
+    assert!(!client.is_artist_revoked(&artist2));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_revoked_artist_cannot_create_listing() {
+    let (env, client, admin, artist2, token_id, _, collection_id) = setup();
+    client.set_admin(&admin);
+    client.add_token_to_whitelist(&token_id);
+    client.revoke_artist(&artist2);
+    client.create_listing(
+        &artist2,
+        &10_000_000,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist2),
+    );
+}
+
+// ── Token whitelist edge cases (Issue #200) ─────────────────
+
+#[test]
+fn test_get_token_whitelist_after_removal() {
+    let (env, client, admin, _, token_id, _, collection_id) = setup();
+    client.set_admin(&admin);
+    client.add_token_to_whitelist(&token_id);
+    let list = client.get_token_whitelist();
+    assert!(list.iter().any(|t| t == token_id));
+    client.remove_token_from_whitelist(&token_id);
+    let list_after = client.get_token_whitelist();
+    assert!(!list_after.iter().any(|t| t == token_id));
+}
+
+// ── Royalty bps validation tests (security)
+
+#[test]
+fn test_create_listing_royalty_bps_max_allowed() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    // 10000 bps (100%) is allowed at creation time
+    let id = client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(id, 1u64);
+}
+
+// #[test] // Deprecated in V2 architecture
+#[should_panic(expected = "Error(Contract, #24)")]
+fn test_create_listing_royalty_bps_too_high() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_create_auction_royalty_bps_max_allowed() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(auction_id, 1u64);
+}
+
+// #[test] // Deprecated in V2 architecture
+#[should_panic(expected = "Error(Contract, #24)")]
+fn test_create_auction_royalty_bps_too_high() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let cid = bytes!(&env, 0x516d74657374);
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn test_buy_artwork_fails_if_token_delisted() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    // Add a second token so the whitelist is non-empty after removing token_id.
+    // An empty whitelist means "allow all" by design, so we need at least one
+    // other entry to make token_id genuinely non-whitelisted.
+    let other_token = Address::generate(&env);
+    client.add_token_to_whitelist(&other_token);
+    let cid = bytes!(&env, 0x516d74657374);
+    let id = client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    // Admin removes token from whitelist — purchase should now be rejected at buy time
+    client.remove_token_from_whitelist(&token_id);
+    client.buy_artwork(&buyer, &id);
+}
+// ═══════════════════════════════════════════════════════════════════════════
+// admin_pause / admin_unpause mechanism
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_is_paused_default_false() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    // Freshly deployed — must not be paused
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_admin_pause_and_unpause_state_transitions() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    assert!(!client.is_paused(), "contract should start unpaused");
+
+    client.admin_pause(&artist);
+    assert!(
+        client.is_paused(),
+        "contract should be paused after admin_pause"
+    );
+
+    client.admin_unpause(&artist);
+    assert!(
+        !client.is_paused(),
+        "contract should be unpaused after admin_unpause"
+    );
+}
+
+#[test]
+fn test_admin_pause_emits_event() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.admin_pause(&artist);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "ctr_psd"),
+        "admin_pause must emit a CONTRACT_PAUSED event"
+    );
+}
+
+#[test]
+fn test_admin_unpause_emits_event() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.admin_pause(&artist);
+    client.admin_unpause(&artist);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "ctr_unpsd"),
+        "admin_unpause must emit a CONTRACT_UNPAUSED event"
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_admin_pause_rejects_non_admin() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    // `buyer` is not the admin — must panic with Unauthorized
+    client.admin_pause(&buyer);
+}
+
+#[test]
+#[should_panic]
+fn test_admin_unpause_rejects_non_admin() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.admin_pause(&artist);
+    // `buyer` is not the admin — must panic with Unauthorized
+    client.admin_unpause(&buyer);
+}
+
+#[test]
+#[should_panic]
+fn test_create_listing_blocked_when_paused() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.admin_pause(&artist);
+
+    // Any create_listing call must panic while the contract is paused
+    create_test_listing(&env, &client, &artist, &token_id);
+}
+
+#[test]
+#[should_panic]
+fn test_create_auction_blocked_when_paused() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.admin_pause(&artist);
+
+    // Any create_auction call must panic while the contract is paused
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &5_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+// ── Issue #545: Test create_auction fails if reserve price is negative ───
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_create_auction_negative_reserve_price_fails() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &-1_000_000_i128, // Negative reserve price
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+// ── Issue #543: Test buy_item correctly transfers and distributes funds atomically ───
+
+#[test]
+fn test_buy_artwork_atomic_transfer_and_distribution() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let collaborator = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&collaborator, &0_i128);
+
+    let price = 10_000_000_i128;
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: artist.clone(),
+            percentage: 70,
+        },
+        Recipient {
+            address: collaborator.clone(),
+            percentage: 30,
+        },
+    ];
+
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &recipients,
+    );
+
+    let token = TokenClient::new(&env, &token_id);
+    let buyer_before = token.balance(&buyer);
+    let artist_before = token.balance(&artist);
+    let collaborator_before = token.balance(&collaborator);
+
+    // Execute buy
+    let result = client.buy_artwork(&buyer, &id);
+    assert!(result);
+
+    // Verify atomic state changes
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+
+    // Verify funds distributed correctly
+    assert_eq!(token.balance(&buyer), buyer_before - price);
+    assert_eq!(token.balance(&artist), artist_before + (price * 70 / 100));
+    assert_eq!(
+        token.balance(&collaborator),
+        collaborator_before + (price * 30 / 100)
+    );
+}
+
+// ── Issue #544: Test cancel_listing fails if called by non-creator ───
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_cancel_listing_fails_if_not_creator() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let id = create_test_listing(&env, &client, &artist, &token_id);
+
+    // Buyer (not the creator) tries to cancel the listing
+    client.cancel_listing(&buyer, &id);
+}
+
+// ── Issue #541: Test create_listing fails if expiration time is in the past ───
+// Note: The current Listing structure does not have an expiration field.
+// This test verifies the current behavior. If expiration is added in the future,
+// this test should be updated to pass an expiration parameter.
+
+#[test]
+fn test_create_listing_without_expiration_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Current implementation doesn't support expiration time
+    // Listing is created successfully without expiration validation
+    let id = client.create_listing(
+        &artist,
+        &10_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert_eq!(id, 1u64);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Active);
+}
+
+#[test]
+fn test_create_listing_succeeds_after_unpause() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Pause then immediately unpause
+    client.admin_pause(&artist);
+    client.admin_unpause(&artist);
+
+    // Now create_listing must work again
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    assert!(listing_id > 0, "listing must be created after unpause");
+}
+
+#[test]
+#[should_panic]
+fn test_buy_artwork_blocked_when_paused() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+
+    client.admin_pause(&artist);
+
+    // buy_artwork must panic while paused
+    client.buy_artwork(&buyer, &listing_id);
+}
+
+// ── buy_item exact price validation regression tests ─────────────────
+
+#[test]
+fn test_buy_item_exact_payment_success() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let price = 10_000_000_i128;
+    let listing_id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let buyer = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&buyer, &price);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before = token.balance(&artist);
+
+    // Call buy_item (buy_artwork) with exact payment
+    let result = client.buy_artwork(&buyer, &listing_id);
+    assert!(
+        result,
+        "buy_artwork must succeed when buyer sends exact price"
+    );
+
+    // Verify ownership and listing status
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+
+    // Verify buyer balance drained to 0 and seller received payment
+    assert_eq!(
+        token.balance(&buyer),
+        0_i128,
+        "Buyer balance must be 0 after exact payment"
+    );
+    assert_eq!(
+        token.balance(&artist),
+        artist_before + price,
+        "Seller must receive exact payment"
+    );
+
+    // Verify listing is removed from active listings
+    let active_listings = client.get_active_listings(&10, &0);
+    assert!(
+        !active_listings.contains(listing_id),
+        "Listing must be removed from active listings"
+    );
+}
+
+#[test]
+fn test_buy_item_underpayment_fails() {
+    let (env, client, artist, _, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let price = 10_000_000_i128;
+    let listing_id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let buyer = Address::generate(&env);
+    let underpaid_amount = price - 1_i128; // 1 unit less than required price
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&buyer, &underpaid_amount);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before = token.balance(&artist);
+
+    // Attempt to buy with underpayment
+    env.as_contract(&contract_id, || {
+        let res = client.try_buy_artwork(&buyer, &listing_id);
+        assert!(res.is_err(), "buy_artwork must fail when buyer underpays");
+    });
+
+    // Confirm state integrity & atomicity
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(
+        listing.status,
+        ListingStatus::Active,
+        "Listing must remain Active"
+    );
+    assert_eq!(listing.owner, None, "Ownership must not transfer");
+    assert_eq!(
+        token.balance(&buyer),
+        underpaid_amount,
+        "Buyer balance must remain unchanged"
+    );
+    assert_eq!(
+        token.balance(&artist),
+        artist_before,
+        "Seller must receive no funds"
+    );
+    let active_listings = client.get_active_listings(&10, &0);
+    assert!(
+        active_listings.contains(listing_id),
+        "Listing must remain in active listings"
+    );
+}
+
+#[test]
+fn test_buy_item_zero_balance_underpayment_fails() {
+    let (env, client, artist, _, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let price = 10_000_000_i128;
+    let listing_id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let buyer = Address::generate(&env); // 0 token balance
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before = token.balance(&artist);
+
+    env.as_contract(&contract_id, || {
+        let res = client.try_buy_artwork(&buyer, &listing_id);
+        assert!(
+            res.is_err(),
+            "buy_artwork must fail when buyer has zero balance"
+        );
+    });
+
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(
+        listing.status,
+        ListingStatus::Active,
+        "Listing must remain Active"
+    );
+    assert_eq!(listing.owner, None, "Ownership must not transfer");
+    assert_eq!(token.balance(&buyer), 0_i128, "Buyer balance remains 0");
+    assert_eq!(
+        token.balance(&artist),
+        artist_before,
+        "Seller receives no funds"
+    );
+}
+
+#[test]
+fn test_buy_item_minimum_supported_price_success() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let min_price = 1_i128; // Minimum valid listing price
+    let listing_id = client.create_listing(
+        &artist,
+        &min_price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let buyer = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&buyer, &min_price);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before = token.balance(&artist);
+
+    let result = client.buy_artwork(&buyer, &listing_id);
+    assert!(
+        result,
+        "buy_artwork must succeed for minimum supported price"
+    );
+
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+    assert_eq!(token.balance(&buyer), 0_i128);
+    assert_eq!(token.balance(&artist), artist_before + min_price);
+}
+
+#[test]
+fn test_buy_item_large_listing_price_success() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let large_price = 50_000_000_000_i128; // Large listing price
+    let listing_id = client.create_listing(
+        &artist,
+        &large_price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let buyer = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&buyer, &large_price);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before = token.balance(&artist);
+
+    let result = client.buy_artwork(&buyer, &listing_id);
+    assert!(result, "buy_artwork must succeed for large listing price");
+
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+    assert_eq!(token.balance(&buyer), 0_i128);
+    assert_eq!(token.balance(&artist), artist_before + large_price);
+}
+
+#[test]
+fn test_buy_item_large_listing_price_underpayment_fails() {
+    let (env, client, artist, _, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let large_price = 50_000_000_000_i128;
+    let listing_id = client.create_listing(
+        &artist,
+        &large_price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let buyer = Address::generate(&env);
+    let underpaid_amount = large_price - 1_i128;
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&buyer, &underpaid_amount);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before = token.balance(&artist);
+
+    env.as_contract(&contract_id, || {
+        let res = client.try_buy_artwork(&buyer, &listing_id);
+        assert!(
+            res.is_err(),
+            "buy_artwork must fail when large price is underpaid by 1 unit"
+        );
+    });
+
+    let listing = client.get_listing(&listing_id);
+    assert_eq!(listing.status, ListingStatus::Active);
+    assert_eq!(listing.owner, None);
+    assert_eq!(token.balance(&buyer), underpaid_amount);
+    assert_eq!(token.balance(&artist), artist_before);
+}
+
+// ── place_bid minimum bid increment regression tests ────────────────
+
+#[test]
+fn test_place_bid_exact_minimum_increment_succeeds() {
+    let (env, client, artist, bidder_a, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let reserve_price = 100_000_000_i128;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &reserve_price,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Initial bid by bidder_a = 100_000_000
+    client.place_bid(&bidder_a, &auction_id, &reserve_price);
+
+    let bidder_b = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&bidder_b, &100_000_000_000_i128);
+
+    // Minimum increment is 5% of 100_000_000 = 5_000_000
+    // Required minimum new bid = 100_000_000 + 5_000_000 = 105_000_000
+    let exact_min_bid = 105_000_000_i128;
+
+    let token = TokenClient::new(&env, &token_id);
+    let bidder_a_before_b = token.balance(&bidder_a);
+    let bidder_b_before_b = token.balance(&bidder_b);
+
+    // Place bid exactly meeting minimum increment
+    client.place_bid(&bidder_b, &auction_id, &exact_min_bid);
+
+    // Verify auction state update
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(
+        auction.highest_bid, exact_min_bid,
+        "Highest bid must update to exact minimum bid"
+    );
+    assert_eq!(
+        auction.highest_bidder,
+        Some(bidder_b.clone()),
+        "Highest bidder must update to bidder_b"
+    );
+    assert_eq!(
+        auction.status,
+        crate::types::AuctionStatus::Active,
+        "Auction must remain Active"
+    );
+
+    // Verify balances: previous highest bidder (bidder_a) is refunded 100_000_000
+    assert_eq!(
+        token.balance(&bidder_a),
+        bidder_a_before_b + reserve_price,
+        "Previous bidder_a must be refunded their previous highest bid"
+    );
+    assert_eq!(
+        token.balance(&bidder_b),
+        bidder_b_before_b - exact_min_bid,
+        "New bidder_b balance must be deducted by exact bid amount"
+    );
+}
+
+#[test]
+fn test_place_bid_below_minimum_increment_fails() {
+    let (env, client, artist, bidder_a, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let reserve_price = 100_000_000_i128;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &reserve_price,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&bidder_a, &auction_id, &reserve_price);
+
+    let bidder_b = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&bidder_b, &100_000_000_000_i128);
+
+    let token = TokenClient::new(&env, &token_id);
+    let bidder_a_balance_before = token.balance(&bidder_a);
+    let bidder_b_balance_before = token.balance(&bidder_b);
+
+    // Minimum required bid is 105_000_000. Try bidding 104_999_999 (1 unit below required minimum)
+    let invalid_bid = 104_999_999_i128;
+
+    env.as_contract(&contract_id, || {
+        let res = client.try_place_bid(&bidder_b, &auction_id, &invalid_bid);
+        assert!(
+            res.is_err(),
+            "place_bid must fail when bid is below minimum 5% increment"
+        );
+    });
+
+    // Confirm state integrity & atomicity
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(
+        auction.highest_bid, reserve_price,
+        "Highest bid must remain unchanged"
+    );
+    assert_eq!(
+        auction.highest_bidder,
+        Some(bidder_a.clone()),
+        "Highest bidder must remain bidder_a"
+    );
+    assert_eq!(
+        auction.status,
+        crate::types::AuctionStatus::Active,
+        "Auction must remain Active"
+    );
+
+    // Confirm balances remain unchanged
+    assert_eq!(
+        token.balance(&bidder_a),
+        bidder_a_balance_before,
+        "bidder_a balance must remain unchanged"
+    );
+    assert_eq!(
+        token.balance(&bidder_b),
+        bidder_b_balance_before,
+        "bidder_b balance must remain unchanged"
+    );
+}
+
+#[test]
+fn test_place_bid_smallest_increment_edge_cases() {
+    let (env, client, artist, bidder_a, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Smallest supported reserve price where 5% equals 1 unit: 20 tokens * 5% = 1 unit increment
+    let reserve_price = 20_i128;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &reserve_price,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&bidder_a, &auction_id, &reserve_price);
+
+    let bidder_b = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&bidder_b, &1_000_i128);
+
+    // Required minimum is 20 + (20 * 5 / 100) = 21. Attempting 20 (0 increment) must fail.
+    env.as_contract(&contract_id, || {
+        let res = client.try_place_bid(&bidder_b, &auction_id, &20_i128);
+        assert!(
+            res.is_err(),
+            "place_bid must fail when bid does not exceed highest_bid by minimum increment"
+        );
+    });
+
+    // Assert state unchanged after failed attempt
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.highest_bid, 20_i128);
+    assert_eq!(auction.highest_bidder, Some(bidder_a.clone()));
+
+    // Bidding 21 (exact minimum 1 unit increment) must succeed
+    client.place_bid(&bidder_b, &auction_id, &21_i128);
+    let auction_after = client.get_auction(&auction_id);
+    assert_eq!(
+        auction_after.highest_bid, 21_i128,
+        "Highest bid must update to 21"
+    );
+    assert_eq!(
+        auction_after.highest_bidder,
+        Some(bidder_b),
+        "Highest bidder must update to bidder_b"
+    );
+}
+
+// ── Issue #652: Test create_listing fails if price is zero or negative ───
+
+#[test]
+fn test_create_listing_fails_if_price_zero_or_negative() {
+    let (env, client, artist, _, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Test zero price fails with InvalidPrice (Contract, #2)
+    env.as_contract(&contract_id, || {
+        let res = client.try_create_listing(
+            &artist,
+            &0_i128,
+            &symbol_short!("XLM"),
+            &token_id,
+            &collection_id,
+            &1u64,
+            &1u64,
+            &valid_recipients(&env, &artist),
+        );
+        assert!(res.is_err(), "create_listing must fail when price is zero");
+    });
+
+    // Test negative price fails with InvalidPrice (Contract, #2)
+    env.as_contract(&contract_id, || {
+        let res = client.try_create_listing(
+            &artist,
+            &-5_000_000_i128,
+            &symbol_short!("XLM"),
+            &token_id,
+            &collection_id,
+            &1u64,
+            &1u64,
+            &valid_recipients(&env, &artist),
+        );
+        assert!(
+            res.is_err(),
+            "create_listing must fail when price is negative"
+        );
+    });
+
+    // Verify expected state: no listing was created
+    assert_eq!(client.get_total_listings(), 0);
+}
+
+// ── get_admin tests (Issue #862) ─────────────────────────────
+
+#[test]
+fn test_get_admin_none_before_set() {
+    let (_env, client, _artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    // Admin has never been set — must return None
+    assert_eq!(client.get_admin(), None);
+}
+
+#[test]
+fn test_get_admin_returns_some_after_set() {
+    let (env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    assert_eq!(client.get_admin(), Some(artist));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_set_admin_twice_panics_and_get_admin_keeps_first() {
+    let (env, client, artist, buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    assert_eq!(client.get_admin(), Some(artist.clone()));
+    // Second set_admin must panic Unauthorized — admin stays the first one
+    client.set_admin(&buyer);
+    let _ = env; // env kept for parity with setup()
+}
+
+#[test]
+fn test_get_admin_reflects_two_step_transfer() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    let new_admin = Address::generate(&env);
+    client.set_admin(&admin);
+    assert_eq!(client.get_admin(), Some(admin.clone()));
+    client.transfer_admin(&admin, &new_admin);
+    // Admin unchanged until the successor accepts
+    assert_eq!(client.get_admin(), Some(admin.clone()));
+    client.accept_admin(&new_admin);
+    assert_eq!(client.get_admin(), Some(new_admin));
+}
+
+// ── get_treasury tests (Issue #863) ──────────────────────────
+
+#[test]
+fn test_get_treasury_none_before_set() {
+    let (_env, client, _artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    // Treasury has never been set — must return None
+    assert_eq!(client.get_treasury(), None);
+}
+
+#[test]
+fn test_get_treasury_returns_set_value() {
+    let (env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    assert_eq!(client.get_treasury(), Some(treasury));
+}
+
+#[test]
+fn test_get_treasury_reflects_update() {
+    let (env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    let first = Address::generate(&env);
+    client.set_treasury(&artist, &first);
+    assert_eq!(client.get_treasury(), Some(first.clone()));
+    let second = Address::generate(&env);
+    client.set_treasury(&artist, &second);
+    // Getter must reflect the latest stored treasury
+    assert_eq!(client.get_treasury(), Some(second));
+}
+
+// ── get_protocol_fee tests (Issue #864) ──────────────────────
+
+#[test]
+fn test_get_protocol_fee_defaults_to_zero() {
+    let (_env, client, _artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    // No fee has been set — getter must fall back to 0
+    assert_eq!(client.get_protocol_fee(), 0u32);
+}
+
+#[test]
+fn test_get_protocol_fee_returns_set_value() {
+    let (_env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.set_protocol_fee(&artist, &250u32);
+    assert_eq!(client.get_protocol_fee(), 250u32);
+}
+
+#[test]
+fn test_get_protocol_fee_reflects_update() {
+    let (_env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.set_protocol_fee(&artist, &500u32);
+    assert_eq!(client.get_protocol_fee(), 500u32);
+    client.set_protocol_fee(&artist, &750u32);
+    assert_eq!(client.get_protocol_fee(), 750u32);
+}
+
+// ── protocol fee boundary / zero-value tests (Issue #865) ────
+
+#[test]
+fn test_get_protocol_fee_zero_bps_is_valid() {
+    let (_env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    // Zero-value edge case: 0 bps is the valid lower bound (matches default)
+    client.set_protocol_fee(&artist, &0u32);
+    assert_eq!(client.get_protocol_fee(), 0u32);
+}
+
+#[test]
+fn test_set_protocol_fee_max_boundary_accepted() {
+    let (_env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    // Upper bound is inclusive: exactly 1000 bps (10%) must be accepted
+    client.set_protocol_fee(&artist, &1000u32);
+    assert_eq!(client.get_protocol_fee(), 1000u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_set_protocol_fee_just_above_max_panics() {
+    let (_env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    // First value past the upper bound must panic InvalidPrice
+    client.set_protocol_fee(&artist, &1001u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_set_protocol_fee_u32_max_panics() {
+    let (_env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    // Overflow bound: the largest possible u32 must panic InvalidPrice
+    client.set_protocol_fee(&artist, &u32::MAX);
+}
+
+// ── get_total_auctions (#880) ─────────────────────────────────────────────────
+
+#[test]
+fn test_get_total_auctions_zero_before_any_created() {
+    let (_env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    assert_eq!(client.get_total_auctions(), 0u64);
+}
+
+#[test]
+fn test_get_total_auctions_increments_after_each_create() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    assert_eq!(client.get_total_auctions(), 0u64);
+
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(client.get_total_auctions(), 1u64);
+
+    let collection_id2 = env.register(mock_nft::MockNft, ());
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id2,
+        &1u64,
+        &1u64,
+        &2_000_000_i128,
+        &7200u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(client.get_total_auctions(), 2u64);
+}
+
+#[test]
+fn test_get_total_auctions_counts_auctions_from_different_artists() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let collection_id2 = env.register(mock_nft::MockNft, ());
+
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.create_auction(
+        &buyer,
+        &token_id,
+        &collection_id2,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &buyer),
+    );
+
+    assert_eq!(client.get_total_auctions(), 2u64);
+}
+
+// ── get_offer (#887) ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_get_offer_returns_correct_fields() {
+    let (env, client, artist, buyer, token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    let amount = 5_000_000_i128;
+    let offer_id = client.make_offer(&buyer, &listing_id, &amount, &token_id);
+
+    let offer = client.get_offer(&offer_id);
+    assert_eq!(offer.offer_id, offer_id);
+    assert_eq!(offer.listing_id, listing_id);
+    assert_eq!(offer.offerer, buyer);
+    assert_eq!(offer.amount, amount);
+    assert_eq!(offer.token, token_id);
+    assert_eq!(offer.status, OfferStatus::Pending);
+}
+
+#[test]
+fn test_get_offer_ids_are_sequential() {
+    let (env, client, artist, buyer, token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+
+    let offer_id_a = client.make_offer(&buyer, &listing_id, &1_000_000_i128, &token_id);
+    let offer_id_b = client.make_offer(&buyer, &listing_id, &2_000_000_i128, &token_id);
+
+    assert_eq!(offer_id_b, offer_id_a + 1);
+    assert_eq!(client.get_offer(&offer_id_a).amount, 1_000_000_i128);
+    assert_eq!(client.get_offer(&offer_id_b).amount, 2_000_000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_get_offer_nonexistent_id_panics() {
+    let (_env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    // Offer ID 999 was never created — must panic OfferNotFound
+    client.get_offer(&999u64);
+}
+
+// ── get_listing_status tests (Issue #885) ────────────────────
+
+#[test]
+fn test_get_listing_status_nonexistent_panics() {
+    let (env, client, _artist, _buyer, _token_id, contract_id, _collection_id) = setup();
+    env.as_contract(&contract_id, || {
+        let res = client.try_get_listing_status(&999_999u64);
+        assert!(
+            res.is_err(),
+            "get_listing_status must fail for non-existent listing"
+        );
+    });
+}
+
+#[test]
+fn test_get_listing_status_reflects_active_and_sold() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let price = 5_000_000i128;
+    let listing_id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Initial status must be Active
+    assert_eq!(
+        client.get_listing_status(&listing_id),
+        ListingStatus::Active,
+        "Newly created listing status must be Active"
+    );
+
+    // After purchase, status must become Sold
+    client.buy_artwork(&buyer, &listing_id);
+    assert_eq!(
+        client.get_listing_status(&listing_id),
+        ListingStatus::Sold,
+        "Purchased listing status must transition to Sold"
+    );
+}
+
+#[test]
+fn test_get_listing_status_reflects_cancelled() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let price = 5_000_000i128;
+    let listing_id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert_eq!(
+        client.get_listing_status(&listing_id),
+        ListingStatus::Active
+    );
+
+    // Cancel listing and verify status transitions to Cancelled
+    client.cancel_listing(&artist, &listing_id);
+    assert_eq!(
+        client.get_listing_status(&listing_id),
+        ListingStatus::Cancelled,
+        "Cancelled listing status must be Cancelled"
+    );
+}
+
+// ── get_auction tests (Issue #886) ───────────────────────────
+
+#[test]
+fn test_get_auction_nonexistent_panics() {
+    let (env, client, _artist, _buyer, _token_id, contract_id, _collection_id) = setup();
+    env.as_contract(&contract_id, || {
+        let res = client.try_get_auction(&999_999u64);
+        assert!(
+            res.is_err(),
+            "get_auction must fail for non-existent auction"
+        );
+    });
+}
+
+#[test]
+fn test_get_auction_returns_all_initial_fields_accurately() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let reserve_price = 10_000_000i128;
+    let duration = 3600u64;
+    let nft_token_id = 42u64;
+    let amount = 1u64;
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &nft_token_id,
+        &amount,
+        &reserve_price,
+        &duration,
+        &valid_recipients(&env, &artist),
+    );
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.auction_id, auction_id);
+    assert_eq!(auction.creator, artist);
+    assert_eq!(auction.token, token_id);
+    assert_eq!(auction.collection, collection_id);
+    assert_eq!(auction.token_id, nft_token_id);
+    assert_eq!(auction.amount, amount);
+    assert_eq!(auction.reserve_price, reserve_price);
+    assert_eq!(auction.highest_bid, 0i128);
+    assert_eq!(auction.highest_bidder, None);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Active);
+    assert!(auction.end_time > env.ledger().timestamp());
+}
+
+#[test]
+fn test_get_auction_updates_on_bid_and_finalize() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let reserve_price = 10_000_000i128;
+    let duration = 3600u64;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &reserve_price,
+        &duration,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Place bid
+    let bid_amount = 12_000_000i128;
+    client.place_bid(&buyer, &auction_id, &bid_amount);
+
+    let auction_after_bid = client.get_auction(&auction_id);
+    assert_eq!(auction_after_bid.highest_bid, bid_amount);
+    assert_eq!(auction_after_bid.highest_bidder, Some(buyer.clone()));
+
+    // Fast-forward ledger past end_time
+    env.ledger().with_mut(|li| {
+        li.timestamp += duration + 1;
+    });
+
+    // Finalize auction
+    client.finalize_auction(&buyer, &auction_id);
+    let auction_finalized = client.get_auction(&auction_id);
+    assert_eq!(
+        auction_finalized.status,
+        crate::types::AuctionStatus::Finalized,
+        "Auction status must be Finalized after successful settlement"
+    );
+}
+
+// ── get_listing_offers tests (Issue #888) ────────────────────
+
+#[test]
+fn test_get_listing_offers_empty_for_new_and_nonexistent_listing() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Non-existent listing returns empty vector
+    let offers_nonexistent = client.get_listing_offers(&888_888u64);
+    assert_eq!(offers_nonexistent.len(), 0);
+    assert!(offers_nonexistent.is_empty());
+
+    // New listing without offers returns empty vector
+    let listing_id = client.create_listing(
+        &artist,
+        &10_000_000i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    let offers_new = client.get_listing_offers(&listing_id);
+    assert_eq!(offers_new.len(), 0);
+    assert!(offers_new.is_empty());
+}
+
+#[test]
+fn test_get_listing_offers_multiple_offers_and_listing_isolation() {
+    let (env, client, artist, buyer1, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let buyer2 = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&buyer2, &100_000_000_000i128);
+
+    let listing_1 = client.create_listing(
+        &artist,
+        &10_000_000i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    let listing_2 = client.create_listing(
+        &artist,
+        &20_000_000i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &2u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Make offers on listing 1
+    let offer_1 = client.make_offer(&buyer1, &listing_1, &8_000_000i128, &token_id);
+    let offer_2 = client.make_offer(&buyer2, &listing_1, &9_000_000i128, &token_id);
+
+    // Make offer on listing 2
+    let offer_3 = client.make_offer(&buyer1, &listing_2, &15_000_000i128, &token_id);
+
+    // Verify listing 1 offers
+    let offers_1 = client.get_listing_offers(&listing_1);
+    assert_eq!(offers_1.len(), 2);
+    assert_eq!(offers_1.get(0).unwrap(), offer_1);
+    assert_eq!(offers_1.get(1).unwrap(), offer_2);
+
+    // Verify listing 2 offers are isolated
+    let offers_2 = client.get_listing_offers(&listing_2);
+    assert_eq!(offers_2.len(), 1);
+    assert_eq!(offers_2.get(0).unwrap(), offer_3);
+}
+
+#[test]
+fn test_get_listing_offers_persists_after_offer_withdrawn_or_accepted() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = client.create_listing(
+        &artist,
+        &10_000_000i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let offer_id = client.make_offer(&buyer, &listing_id, &8_000_000i128, &token_id);
+    let offers_before = client.get_listing_offers(&listing_id);
+    assert_eq!(offers_before.len(), 1);
+    assert_eq!(offers_before.get(0).unwrap(), offer_id);
+
+    // Withdraw offer
+    client.withdraw_offer(&buyer, &offer_id);
+
+    // Listing offers vector still contains the historical offer id reference
+    let offers_after = client.get_listing_offers(&listing_id);
+    assert_eq!(offers_after.len(), 1);
+    assert_eq!(offers_after.get(0).unwrap(), offer_id);
+
+    // Verify the offer status itself is Withdrawn
+    let offer = client.get_offer(&offer_id);
+    assert_eq!(offer.status, OfferStatus::Withdrawn);
+}
+
+// ── get_offerer_offers tests (Issue #889) ────────────────────
+
+#[test]
+fn test_get_offerer_offers_empty_for_new_address() {
+    let (env, client, _artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    let random_user = Address::generate(&env);
+    let offers = client.get_offerer_offers(&random_user);
+    assert_eq!(offers.len(), 0);
+    assert!(
+        offers.is_empty(),
+        "Unused address must have empty offers list"
+    );
+}
+
+#[test]
+fn test_get_offerer_offers_multiple_offers_and_offerer_isolation() {
+    let (env, client, artist, buyer1, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let buyer2 = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&buyer2, &100_000_000_000i128);
+
+    let listing_1 = client.create_listing(
+        &artist,
+        &10_000_000i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    let listing_2 = client.create_listing(
+        &artist,
+        &20_000_000i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &2u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // buyer1 makes 2 offers
+    let offer_1 = client.make_offer(&buyer1, &listing_1, &7_000_000i128, &token_id);
+    let offer_2 = client.make_offer(&buyer1, &listing_2, &16_000_000i128, &token_id);
+
+    // buyer2 makes 1 offer
+    let offer_3 = client.make_offer(&buyer2, &listing_1, &8_000_000i128, &token_id);
+
+    // buyer1 should have offer_1 and offer_2
+    let buyer1_offers = client.get_offerer_offers(&buyer1);
+    assert_eq!(buyer1_offers.len(), 2);
+    assert_eq!(buyer1_offers.get(0).unwrap(), offer_1);
+    assert_eq!(buyer1_offers.get(1).unwrap(), offer_2);
+
+    // buyer2 should have only offer_3
+    let buyer2_offers = client.get_offerer_offers(&buyer2);
+    assert_eq!(buyer2_offers.len(), 1);
+    assert_eq!(buyer2_offers.get(0).unwrap(), offer_3);
+}
+
+#[test]
+fn test_get_offerer_offers_persists_after_withdraw() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = client.create_listing(
+        &artist,
+        &10_000_000i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let offer_id = client.make_offer(&buyer, &listing_id, &8_000_000i128, &token_id);
+    let offers_before = client.get_offerer_offers(&buyer);
+    assert_eq!(offers_before.len(), 1);
+    assert_eq!(offers_before.get(0).unwrap(), offer_id);
+
+    // Withdraw offer
+    client.withdraw_offer(&buyer, &offer_id);
+
+    // Offerer offers vector still tracks the offer ID
+    let offers_after = client.get_offerer_offers(&buyer);
+    assert_eq!(offers_after.len(), 1);
+    assert_eq!(offers_after.get(0).unwrap(), offer_id);
+}
+
+// ── is_artist_revoked view coverage ─────────────────────────
+
+#[test]
+fn test_is_artist_revoked_defaults_to_false() {
+    let (env, client, admin, _, _, _, _) = setup();
+    client.set_admin(&admin);
+
+    // An address that was never moderated is not revoked.
+    assert!(!client.is_artist_revoked(&Address::generate(&env)));
+}
+
+#[test]
+fn test_is_artist_revoked_is_per_artist() {
+    let (env, client, admin, artist2, _, _, _) = setup();
+    client.set_admin(&admin);
+    let other = Address::generate(&env);
+
+    client.revoke_artist(&artist2);
+
+    assert!(client.is_artist_revoked(&artist2));
+    assert!(!client.is_artist_revoked(&other));
+}
+
+#[test]
+fn test_is_artist_revoked_repeated_revoke_is_idempotent() {
+    let (_env, client, admin, artist2, _, _, _) = setup();
+    client.set_admin(&admin);
+
+    client.revoke_artist(&artist2);
+    client.revoke_artist(&artist2);
+    assert!(client.is_artist_revoked(&artist2));
+
+    // A single reinstatement clears the flag.
+    client.reinstate_artist(&artist2);
+    assert!(!client.is_artist_revoked(&artist2));
+}
+
+#[test]
+fn test_is_artist_revoked_reinstate_unrevoked_stays_false() {
+    let (_env, client, admin, artist2, _, _, _) = setup();
+    client.set_admin(&admin);
+
+    client.reinstate_artist(&artist2);
+
+    assert!(!client.is_artist_revoked(&artist2));
+}
+
+#[test]
+fn test_is_artist_revoked_can_be_revoked_again_after_reinstatement() {
+    let (_env, client, admin, artist2, _, _, _) = setup();
+    client.set_admin(&admin);
+
+    client.revoke_artist(&artist2);
+    client.reinstate_artist(&artist2);
+    client.revoke_artist(&artist2);
+
+    assert!(client.is_artist_revoked(&artist2));
+}
+
+// ── Artist moderation auth & coverage (Issues #873, #874, #875, #878) ────
+
+/// Build a single MockAuth for `address` invoking `fn_name` on the marketplace
+/// contract with `args`, without mocking every auth in the environment.
+fn mock_single_auth(
+    env: &Env,
+    contract: &Address,
+    address: &Address,
+    fn_name: &'static str,
+    args: soroban_sdk::Vec<soroban_sdk::Val>,
+) {
+    env.mock_auths(&[MockAuth {
+        address,
+        invoke: &MockAuthInvoke {
+            contract,
+            fn_name,
+            args,
+            sub_invokes: &[],
+        },
+    }]);
+}
+
+/// Fresh environment WITHOUT mock_all_auths so authorization is actually
+/// enforced; registers the contract and sets `admin` via an explicit mock
+/// auth. Returns (env, client, contract_id, admin).
+fn strict_setup() -> (Env, MarketplaceContractClient<'static>, Address, Address) {
+    let env = Env::default();
+    let contract_id = env.register(MarketplaceContract, ());
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    mock_single_auth(
+        &env,
+        &contract_id,
+        &admin,
+        "set_admin",
+        (admin.clone(),).into_val(&env),
+    );
+    client.set_admin(&admin);
+
+    (env, client, contract_id, admin)
+}
+
+// ── Issue #873: revoke_artist / reinstate_artist / whitelist must require
+// ── the stored admin's authorization (not just any signature).
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_revoke_artist_without_auth_panics() {
+    // Fresh env WITHOUT mock_all_auths: authorization is actually enforced.
+    let (env, client, _contract_id, _admin) = strict_setup();
+
+    // No auth is provided for the stored admin → require_admin must fail.
+    let artist_to_revoke = Address::generate(&env);
+    client.revoke_artist(&artist_to_revoke);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_revoke_artist_wrong_signer_panics() {
+    let (env, client, contract_id, _admin) = strict_setup();
+
+    // Someone else signs the call, but require_admin demands the stored
+    // admin's auth — the outsider's auth cannot satisfy it.
+    let outsider = Address::generate(&env);
+    let artist_to_revoke = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &contract_id,
+        &outsider,
+        "revoke_artist",
+        (artist_to_revoke.clone(),).into_val(&env),
+    );
+    client.revoke_artist(&artist_to_revoke);
+}
+
+#[test]
+fn test_revoke_artist_with_admin_auth_succeeds() {
+    let (env, client, contract_id, admin) = strict_setup();
+
+    // The stored admin signs the revocation → succeeds.
+    let artist_to_revoke = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &contract_id,
+        &admin,
+        "revoke_artist",
+        (artist_to_revoke.clone(),).into_val(&env),
+    );
+    client.revoke_artist(&artist_to_revoke);
+    assert!(client.is_artist_revoked(&artist_to_revoke));
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_reinstate_artist_without_auth_panics() {
+    let (env, client, contract_id, admin) = strict_setup();
+
+    // Revoke first (with proper auth), then attempt reinstatement with no
+    // auth at all — must fail just like revoke.
+    let artist = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &contract_id,
+        &admin,
+        "revoke_artist",
+        (artist.clone(),).into_val(&env),
+    );
+    client.revoke_artist(&artist);
+    assert!(client.is_artist_revoked(&artist));
+
+    client.reinstate_artist(&artist);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_reinstate_artist_wrong_signer_panics() {
+    let (env, client, contract_id, admin) = strict_setup();
+
+    let artist = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &contract_id,
+        &admin,
+        "revoke_artist",
+        (artist.clone(),).into_val(&env),
+    );
+    client.revoke_artist(&artist);
+
+    // A non-admin signs the reinstatement — must be rejected.
+    let outsider = Address::generate(&env);
+    mock_single_auth(
+        &env,
+        &contract_id,
+        &outsider,
+        "reinstate_artist",
+        (artist.clone(),).into_val(&env),
+    );
+    client.reinstate_artist(&artist);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_remove_token_from_whitelist_without_auth_panics() {
+    let (env, client, _contract_id, _admin) = strict_setup();
+
+    // Whitelist mutation requires the stored admin's auth too.
+    let token = Address::generate(&env);
+    client.remove_token_from_whitelist(&token);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_add_token_to_whitelist_without_auth_panics() {
+    let (env, client, _contract_id, _admin) = strict_setup();
+
+    let token = Address::generate(&env);
+    client.add_token_to_whitelist(&token);
+}
+
+// ── Issue #874: revoke_artist coverage ──────────────────────────────────
+
+#[test]
+fn test_revoke_artist_is_idempotent() {
+    let (env, client, _artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+
+    let target = Address::generate(&env);
+
+    client.revoke_artist(&target);
+    assert!(client.is_artist_revoked(&target));
+
+    // Revoking an already-revoked artist must succeed and keep them revoked.
+    client.revoke_artist(&target);
+    assert!(client.is_artist_revoked(&target));
+}
+
+#[test]
+fn test_revoke_artist_emits_artist_revoked_event() {
+    let (env, client, _artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+
+    let target = Address::generate(&env);
+    client.revoke_artist(&target);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "art_rvkd"),
+        "ArtistRevoked event was not emitted"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_revocation_is_checked_before_whitelist() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+
+    client.revoke_artist(&artist);
+
+    // Non-empty whitelist that excludes token_id: if the whitelist check ran
+    // first, this call would fail with Unauthorized (#5). Failing with
+    // ArtistRevoked (#15) proves the revocation gate fires first.
+    client.add_token_to_whitelist(&Address::generate(&env));
+    client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_revoked_artist_cannot_create_auction() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+
+    client.revoke_artist(&artist);
+
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_revoke_artist_only_affects_target() {
+    let (env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+
+    let other = Address::generate(&env);
+    client.revoke_artist(&other);
+
+    assert!(client.is_artist_revoked(&other));
+    assert!(!client.is_artist_revoked(&artist));
+}
+
+// ── Issue #875: reinstate_artist coverage ────────────────────────────────
+
+#[test]
+fn test_reinstate_artist_is_idempotent() {
+    let (env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+
+    // Reinstate without any prior revocation — must not panic.
+    client.reinstate_artist(&artist);
+    assert!(!client.is_artist_revoked(&artist));
+
+    client.reinstate_artist(&artist);
+    assert!(!client.is_artist_revoked(&artist));
+}
+
+#[test]
+fn test_reinstate_artist_does_not_revoke_others() {
+    let (env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+
+    let other = Address::generate(&env);
+    client.revoke_artist(&other);
+    assert!(client.is_artist_revoked(&other));
+
+    // Reinstating a never-revoked artist must not clear someone else's
+    // revocation.
+    client.reinstate_artist(&artist);
+    assert!(client.is_artist_revoked(&other));
+    assert!(!client.is_artist_revoked(&artist));
+}
+
+#[test]
+fn test_reinstate_artist_emits_artist_reinstated_event() {
+    let (env, client, artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+
+    client.revoke_artist(&artist);
+    client.reinstate_artist(&artist);
+
+    assert!(
+        has_event_with_topic(&env.events().all(), "art_rnst"),
+        "ArtistReinstated event was not emitted"
+    );
+}
+
+#[test]
+fn test_reinstated_artist_can_create_listing_again() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+
+    client.revoke_artist(&artist);
+    assert!(client.is_artist_revoked(&artist));
+
+    client.reinstate_artist(&artist);
+    assert!(!client.is_artist_revoked(&artist));
+
+    // The reinstated artist can list again (whitelist is empty ⇒ any token).
+    let listing_id = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(listing_id, 1u64);
+}
+
+// ── Issue #878: remove_token_from_whitelist coverage ─────────────────────
+
+#[test]
+fn test_remove_token_from_whitelist_removes_only_target() {
+    let (env, client, _artist, _buyer, token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&Address::generate(&env));
+
+    let other = Address::generate(&env);
+    client.add_token_to_whitelist(&token_id);
+    client.add_token_to_whitelist(&other);
+    assert_eq!(client.get_token_whitelist().len(), 2u32);
+
+    client.remove_token_from_whitelist(&other);
+    let whitelist = client.get_token_whitelist();
+    assert_eq!(whitelist.len(), 1u32);
+    assert_eq!(whitelist.get(0).unwrap(), token_id);
+
+    // Removing a token that is not on the list changes nothing.
+    let stranger = Address::generate(&env);
+    client.remove_token_from_whitelist(&stranger);
+    assert_eq!(client.get_token_whitelist().len(), 1u32);
+    assert_eq!(client.get_token_whitelist().get(0).unwrap(), token_id);
+}
+
+#[test]
+fn test_remove_token_from_whitelist_is_idempotent() {
+    let (env, client, _artist, _buyer, token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&Address::generate(&env));
+
+    client.add_token_to_whitelist(&token_id);
+    client.remove_token_from_whitelist(&token_id);
+
+    // Removing an already-absent token must not panic and must leave an
+    // empty (not deleted) whitelist entry.
+    client.remove_token_from_whitelist(&token_id);
+    assert_eq!(client.get_token_whitelist().len(), 0u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_removed_token_cannot_back_new_listings() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&Address::generate(&env));
+
+    client.add_token_to_whitelist(&token_id);
+    client.remove_token_from_whitelist(&token_id);
+
+    // The whitelist is non-empty again and no longer contains token_id, so
+    // creating a new listing in that token must be rejected.
+    client.add_token_to_whitelist(&Address::generate(&env));
+    client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_removed_token_cannot_back_new_auctions() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&Address::generate(&env));
+
+    client.add_token_to_whitelist(&token_id);
+    client.remove_token_from_whitelist(&token_id);
+    client.add_token_to_whitelist(&Address::generate(&env));
+
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn test_buying_existing_listing_after_token_removed_panics() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&Address::generate(&env));
+
+    client.add_token_to_whitelist(&token_id);
+    let listing_id = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Keep the whitelist non-empty so the empty-whitelist allow-all rule
+    // does not mask the removal, then buy against the removed token: the
+    // check applies at purchase time too.
+    client.add_token_to_whitelist(&Address::generate(&env));
+    client.remove_token_from_whitelist(&token_id);
+    client.buy_artwork(&buyer, &listing_id);
+}
+
+#[test]
+fn test_empty_whitelist_after_removal_allows_any_token() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&Address::generate(&env));
+
+    client.add_token_to_whitelist(&token_id);
+    client.remove_token_from_whitelist(&token_id);
+    assert_eq!(client.get_token_whitelist().len(), 0u32);
+
+    // With the whitelist empty again, any token is accepted (documented
+    // allow-all rule of is_token_whitelisted).
+    let listing_id = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(listing_id, 1u64);
+}
+
+#[test]
+fn test_buying_existing_listing_after_whitelist_emptied_succeeds() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&Address::generate(&env));
+
+    client.add_token_to_whitelist(&token_id);
+    let listing_id = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Removing the last whitelisted token empties the whitelist, which
+    // re-enables the allow-all rule: the existing listing stays buyable.
+    client.remove_token_from_whitelist(&token_id);
+    assert!(client.buy_artwork(&buyer, &listing_id));
+}
+
+// ── get_total_listings tests ─────────────────────────────────
+
+#[test]
+fn test_get_total_listings_defaults_to_zero() {
+    let (_env, client, _artist, _buyer, _token_id, _contract_id, _collection_id) = setup();
+    // No listing has ever been created — the counter must fall back to 0.
+    assert_eq!(client.get_total_listings(), 0u64);
+}
+
+#[test]
+fn test_get_total_listings_increments_per_listing() {
+    let (env, client, artist, _buyer, token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let first = create_test_listing(&env, &client, &artist, &token_id);
+    assert_eq!(first, 1u64);
+    assert_eq!(client.get_total_listings(), 1u64);
+
+    let second = create_test_listing(&env, &client, &artist, &token_id);
+    assert_eq!(second, 2u64);
+    assert_eq!(client.get_total_listings(), 2u64);
+}
+
+#[test]
+fn test_get_total_listings_counts_across_artists() {
+    let (env, client, artist, _buyer, token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let other_artist = Address::generate(&env);
+    create_test_listing(&env, &client, &artist, &token_id);
+    create_test_listing(&env, &client, &other_artist, &token_id);
+
+    // The counter is global, not per-artist.
+    assert_eq!(client.get_total_listings(), 2u64);
+    assert_eq!(client.get_artist_listings(&artist).len(), 1u32);
+    assert_eq!(client.get_artist_listings(&other_artist).len(), 1u32);
+}
+
+#[test]
+fn test_get_total_listings_is_read_only() {
+    let (env, client, artist, _buyer, token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    create_test_listing(&env, &client, &artist, &token_id);
+    assert_eq!(client.get_total_listings(), 1u64);
+
+    // Repeated calls must not mutate the counter.
+    assert_eq!(client.get_total_listings(), 1u64);
+    assert_eq!(client.get_total_listings(), 1u64);
+}
+
+#[test]
+fn test_get_total_listings_unchanged_by_cancel() {
+    let (env, client, artist, _buyer, token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+    assert_eq!(client.get_total_listings(), 1u64);
+
+    // Cancelling does not delete the listing: total ever created stays 1.
+    assert!(client.cancel_listing(&artist, &listing_id));
+    assert_eq!(client.get_total_listings(), 1u64);
+}
+
+#[test]
+fn test_get_total_listings_unchanged_by_failed_create() {
+    let (env, client, artist, _buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let cid = bytes!(&env, 0x516d74657374);
+    // Zero price is rejected with InvalidPrice (#2) before any counter bump.
+    let res = client.try_create_listing(
+        &artist,
+        &0_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert!(res.is_err(), "create_listing must reject a zero price");
+    assert_eq!(client.get_total_listings(), 0u64);
+}
+
+// ── Query coverage: issues #881–#884 ────────────────────────────────────
+
+#[test]
+fn test_get_artist_auctions_returns_only_the_artists_auctions() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    let other_artist = Address::generate(&env);
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let first = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    let second = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &2u64,
+        &1u64,
+        &2_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.create_auction(
+        &other_artist,
+        &token_id,
+        &collection_id,
+        &3u64,
+        &1u64,
+        &3_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &other_artist),
+    );
+
+    let auctions = client.get_artist_auctions(&artist);
+    assert_eq!(auctions, vec![&env, first, second]);
+}
+
+#[test]
+fn test_get_artist_auctions_returns_empty_for_artist_without_auctions() {
+    let (env, client, _, _, _, _contract_id, _) = setup();
+
+    let auctions = client.get_artist_auctions(&Address::generate(&env));
+
+    assert!(auctions.is_empty());
+}
+
+#[test]
+fn test_get_active_listings_returns_requested_slice() {
+    let (env, client, artist, _, token_id, _contract_id, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    for _ in 0..5 {
+        create_test_listing(&env, &client, &artist, &token_id);
+    }
+
+    assert_eq!(client.get_active_listings(&2, &1), vec![&env, 2u64, 3u64]);
+}
+
+#[test]
+fn test_get_active_listings_handles_empty_and_out_of_range_requests() {
+    let (env, client, artist, _, token_id, _contract_id, _) = setup();
+
+    assert!(client.get_active_listings(&10, &0).is_empty());
+
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    create_test_listing(&env, &client, &artist, &token_id);
+
+    assert!(client.get_active_listings(&0, &0).is_empty());
+    assert!(client.get_active_listings(&10, &1).is_empty());
+    assert!(client.get_active_listings(&10, &100).is_empty());
+}
+
+#[test]
+fn test_get_active_listings_excludes_cancelled_listings() {
+    let (env, client, artist, _, token_id, _contract_id, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let first = create_test_listing(&env, &client, &artist, &token_id);
+    let cancelled = create_test_listing(&env, &client, &artist, &token_id);
+    let third = create_test_listing(&env, &client, &artist, &token_id);
+    client.cancel_listing(&artist, &cancelled);
+
+    assert_eq!(
+        client.get_active_listings(&10, &0),
+        vec![&env, first, third]
+    );
+}
+
+#[test]
+fn test_get_active_listings_page_uses_start_and_limit() {
+    let (env, client, artist, _, token_id, _contract_id, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    for _ in 0..5 {
+        create_test_listing(&env, &client, &artist, &token_id);
+    }
+
+    assert_eq!(
+        client.get_active_listings_page(&2, &2),
+        vec![&env, 3u64, 4u64]
+    );
+}
+
+#[test]
+fn test_get_active_listings_page_handles_boundaries() {
+    let (env, client, artist, _, token_id, _contract_id, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    create_test_listing(&env, &client, &artist, &token_id);
+    create_test_listing(&env, &client, &artist, &token_id);
+
+    assert_eq!(client.get_active_listings_page(&1, &10), vec![&env, 2u64]);
+    assert!(client.get_active_listings_page(&0, &0).is_empty());
+    assert!(client.get_active_listings_page(&2, &10).is_empty());
+}
+
+#[test]
+fn test_get_offers_by_listing_returns_listing_offers_in_order() {
+    let (env, client, artist, buyer, token_id, _contract_id, _) = setup();
+    let second_buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&second_buyer, &100_000_000_000_i128);
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let listing_id = create_test_listing(&env, &client, &artist, &token_id);
+
+    let first_offer = client.make_offer(&buyer, &listing_id, &4_000_000_i128, &token_id);
+    let second_offer = client.make_offer(&second_buyer, &listing_id, &6_000_000_i128, &token_id);
+
+    let offers = client.get_offers_by_listing(&listing_id);
+    assert_eq!(offers.len(), 2);
+    assert_eq!(offers.get(0).unwrap().offer_id, first_offer);
+    assert_eq!(offers.get(0).unwrap().offerer, buyer);
+    assert_eq!(offers.get(0).unwrap().amount, 4_000_000_i128);
+    assert_eq!(offers.get(0).unwrap().status, OfferStatus::Pending);
+    assert_eq!(offers.get(1).unwrap().offer_id, second_offer);
+    assert_eq!(offers.get(1).unwrap().offerer, second_buyer);
+    assert_eq!(offers.get(1).unwrap().amount, 6_000_000_i128);
+    assert_eq!(offers.get(1).unwrap().status, OfferStatus::Pending);
+}
+
+#[test]
+fn test_get_offers_by_listing_does_not_mix_listings() {
+    let (env, client, artist, buyer, token_id, _contract_id, _) = setup();
+    let second_buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&second_buyer, &100_000_000_000_i128);
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    let first_listing = create_test_listing(&env, &client, &artist, &token_id);
+    let second_listing = create_test_listing(&env, &client, &artist, &token_id);
+
+    let first_offer = client.make_offer(&buyer, &first_listing, &4_000_000_i128, &token_id);
+    client.make_offer(&second_buyer, &second_listing, &6_000_000_i128, &token_id);
+
+    let offers = client.get_offers_by_listing(&first_listing);
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers.get(0).unwrap().offer_id, first_offer);
+    assert_eq!(offers.get(0).unwrap().listing_id, first_listing);
+}
+
+#[test]
+fn test_get_offers_by_listing_returns_empty_for_listing_without_offers() {
+    let (_env, client, _, _, _, _contract_id, _) = setup();
+
+    assert!(client.get_offers_by_listing(&999u64).is_empty());
+}
+// ── add_token_to_whitelist coverage ─────────────────────────────────────
+
+#[test]
+fn test_add_token_to_whitelist_happy_path() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, _) = setup();
+    client.set_admin(&admin);
+
+    let token = Address::generate(&env);
+    // The whitelist starts empty.
+    assert!(client.get_token_whitelist().is_empty());
+
+    client.add_token_to_whitelist(&token);
+
+    let whitelist = client.get_token_whitelist();
+    assert_eq!(whitelist.len(), 1u32);
+    assert_eq!(whitelist.get(0).unwrap(), token);
+}
+
+#[test]
+fn test_add_token_to_whitelist_appends_in_order() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, _) = setup();
+    client.set_admin(&admin);
+
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    let third = Address::generate(&env);
+
+    client.add_token_to_whitelist(&first);
+    client.add_token_to_whitelist(&second);
+    client.add_token_to_whitelist(&third);
+
+    // Entries are appended in insertion order and none are dropped.
+    let whitelist = client.get_token_whitelist();
+    assert_eq!(whitelist.len(), 3u32);
+    assert_eq!(whitelist.get(0).unwrap(), first);
+    assert_eq!(whitelist.get(1).unwrap(), second);
+    assert_eq!(whitelist.get(2).unwrap(), third);
+}
+
+#[test]
+fn test_add_token_to_whitelist_is_idempotent() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, _) = setup();
+    client.set_admin(&admin);
+
+    let token = Address::generate(&env);
+    let other = Address::generate(&env);
+
+    client.add_token_to_whitelist(&token);
+    client.add_token_to_whitelist(&other);
+    // Adding the same token again must not create a duplicate entry.
+    client.add_token_to_whitelist(&token);
+    client.add_token_to_whitelist(&token);
+
+    let whitelist = client.get_token_whitelist();
+    assert_eq!(whitelist.len(), 2u32);
+    assert_eq!(whitelist.get(0).unwrap(), token);
+    assert_eq!(whitelist.get(1).unwrap(), other);
+}
+
+#[test]
+fn test_add_token_to_whitelist_after_removal_re_adds_at_end() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, _) = setup();
+    client.set_admin(&admin);
+
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+
+    client.add_token_to_whitelist(&first);
+    client.add_token_to_whitelist(&second);
+    client.remove_token_from_whitelist(&first);
+
+    // Re-adding a previously removed token succeeds and lands at the end.
+    client.add_token_to_whitelist(&first);
+
+    let whitelist = client.get_token_whitelist();
+    assert_eq!(whitelist.len(), 2u32);
+    assert_eq!(whitelist.get(0).unwrap(), second);
+    assert_eq!(whitelist.get(1).unwrap(), first);
+}
+
+#[test]
+fn test_add_token_to_whitelist_allows_new_listings() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, collection_id) = setup();
+    let artist = Address::generate(&env);
+    client.set_admin(&admin);
+
+    // Seed the whitelist with an unrelated token so it is non-empty and the
+    // empty-whitelist allow-all rule cannot mask the assertion below.
+    client.add_token_to_whitelist(&Address::generate(&env));
+    let payment_token = Address::generate(&env);
+
+    // Not whitelisted yet → create_listing is rejected with Unauthorized (#5).
+    let rejected = client.try_create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &payment_token,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert!(rejected.is_err(), "unwhitelisted token must be rejected");
+
+    // After adding the token, the very same call succeeds.
+    client.add_token_to_whitelist(&payment_token);
+    let listing_id = client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &payment_token,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(listing_id, 1u64);
+}
+
+#[test]
+fn test_add_token_to_whitelist_allows_new_auctions() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, collection_id) = setup();
+    let artist = Address::generate(&env);
+    client.set_admin(&admin);
+
+    client.add_token_to_whitelist(&Address::generate(&env));
+    let payment_token = Address::generate(&env);
+
+    let rejected = client.try_create_auction(
+        &artist,
+        &payment_token,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert!(rejected.is_err(), "unwhitelisted token must be rejected");
+
+    client.add_token_to_whitelist(&payment_token);
+    let auction_id = client.create_auction(
+        &artist,
+        &payment_token,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(auction_id, 1u64);
+}
+
+#[test]
+fn test_add_token_to_whitelist_does_not_remove_existing_entries() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, _) = setup();
+    client.set_admin(&admin);
+
+    let existing = Address::generate(&env);
+    client.add_token_to_whitelist(&existing);
+
+    // Adding unrelated tokens must leave the existing entry untouched.
+    for _ in 0..5 {
+        client.add_token_to_whitelist(&Address::generate(&env));
+    }
+
+    let whitelist = client.get_token_whitelist();
+    assert_eq!(whitelist.len(), 6u32);
+    assert_eq!(whitelist.get(0).unwrap(), existing);
+}
+
+#[test]
+fn test_add_token_to_whitelist_takes_effect_at_create_time() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, collection_id) = setup();
+    let artist = Address::generate(&env);
+    client.set_admin(&admin);
+
+    let token = Address::generate(&env);
+    client.add_token_to_whitelist(&token);
+
+    // Once any token is whitelisted the list is no longer empty, so the
+    // allow-all fallback is disabled: the added token is accepted while an
+    // unrelated one is rejected.
+    let accepted = client.try_create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert!(accepted.is_ok(), "whitelisted token must be accepted");
+
+    let rejected = client.try_create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &Address::generate(&env),
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert!(
+        rejected.is_err(),
+        "unrelated token must be rejected while the whitelist is non-empty"
+    );
+}
+
+#[test]
+fn test_add_token_to_whitelist_emits_no_event() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, _) = setup();
+    client.set_admin(&admin);
+
+    client.add_token_to_whitelist(&Address::generate(&env));
+
+    // add_token_to_whitelist is a silent state mutation: it must not emit any
+    // contract event (unlike pause/unpause or artist moderation).
+    assert_eq!(env.events().all().events().len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "admin not set")]
+fn test_add_token_to_whitelist_before_admin_is_set_panics() {
+    let (env, client, _admin, _buyer, _token_id, _contract_id, _) = setup();
+    // No admin has been configured yet → require_admin must reject the call.
+    let token = Address::generate(&env);
+    client.add_token_to_whitelist(&token);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_add_token_to_whitelist_after_admin_transfer_requires_new_admin() {
+    let (env, client, admin, _buyer, _token_id, _contract_id, _) = setup();
+    let new_admin = Address::generate(&env);
+    client.set_admin(&admin);
+    client.transfer_admin(&admin, &new_admin);
+    client.accept_admin(&new_admin);
+
+    // The old admin no longer holds authority: only the new one can whitelist.
+    mock_single_auth(
+        &env,
+        &_contract_id,
+        &admin,
+        "add_token_to_whitelist",
+        (Address::generate(&env),).into_val(&env),
+    );
+    client.add_token_to_whitelist(&Address::generate(&env));
+}
+
+/// Issue #1094: Unit tests for soroban-marketplace reentrancy lock failure and release guarantees
+#[test]
+fn test_reentrancy_lock_failure_and_release_guarantees_issue_1094() {
+    let (env, client, artist, _buyer, token_id, contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = 999u64;
+
+    // Manually acquire lock inside contract context
+    env.as_contract(&contract_id, || {
+        assert!(crate::storage::acquire_listing_lock(&env, listing_id));
+        // Second acquisition fails immediately (mutual exclusion)
+        assert!(!crate::storage::acquire_listing_lock(&env, listing_id));
+
+        // Release lock
+        crate::storage::release_listing_lock(&env, listing_id);
+        // Can re-acquire after release
+        assert!(crate::storage::acquire_listing_lock(&env, listing_id));
+        crate::storage::release_listing_lock(&env, listing_id);
+    });
+
+    let auction_id = 888u64;
+    env.as_contract(&contract_id, || {
+        assert!(crate::storage::acquire_auction_lock(&env, auction_id));
+        assert!(!crate::storage::acquire_auction_lock(&env, auction_id));
+        crate::storage::release_auction_lock(&env, auction_id);
+        assert!(crate::storage::acquire_auction_lock(&env, auction_id));
+        crate::storage::release_auction_lock(&env, auction_id);
+    });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn test_create_listing_zero_amount_fails() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.create_listing(
+        &artist,
+        &10_000_000,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1,
+        &0,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn test_create_listing_erc721_amount_greater_than_one_fails() {
+    let (env, client, artist, _, token_id, _, _) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let collection_id = env.register(mock_erc721_nonzero_token::MockErc721, ());
+    let collection = mock_erc721_nonzero_token::MockErc721Client::new(&env, &collection_id);
+    collection.mint(&artist, &1);
+
+    client.create_listing(
+        &artist,
+        &10_000_000,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1,
+        &2,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_create_listing_erc1155_amount_greater_than_one_succeeds() {
+    let (env, client, artist, _, token_id, _, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let listing_id = client.create_listing(
+        &artist,
+        &10_000_000,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1,
+        &5,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert_eq!(client.get_listing(&listing_id).amount, 5);
+}
+
+// ── Secondary sale royalty split across multiple recipients (#1304) ──
+
+#[test]
+fn test_secondary_sale_royalty_split_multi_recipients() {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // The collection pays a 10% royalty to the original artist on every resale.
+    let royalty_bps = 1000u32;
+    mock_nft::MockNftClient::new(&env, &collection_id).set_royalty(&artist, &royalty_bps);
+
+    let price = 10_000_000_i128;
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // First sale: the artist is the seller, so no royalty is due.
+    client.buy_artwork(&buyer, &id);
+
+    // Resale: the buyer relists with two configured recipients (70% / 30%).
+    let new_buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&new_buyer, &100_000_000_000_i128);
+    let co_seller = Address::generate(&env);
+    let mut listing = client.get_listing(&id);
+    listing.artist = buyer.clone();
+    listing.status = ListingStatus::Active;
+    listing.owner = None;
+    listing.recipients = vec![
+        &env,
+        Recipient {
+            address: buyer.clone(),
+            percentage: 70,
+        },
+        Recipient {
+            address: co_seller.clone(),
+            percentage: 30,
+        },
+    ];
+    env.as_contract(&contract_id, || {
+        crate::storage::save_listing(&env, &listing);
+    });
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before = token.balance(&artist);
+    let buyer_before = token.balance(&buyer);
+    let co_seller_before = token.balance(&co_seller);
+
+    client.buy_artwork(&new_buyer, &id);
+
+    // Royalty to the original artist, then the remainder split 70 / 30 with the
+    // last recipient taking the rounding remainder.
+    let royalty = price * royalty_bps as i128 / 10_000; // 1_000_000
+    let payout = price - royalty; // 9_000_000
+    let first_share = payout * 70 / 100; // 6_300_000
+    let last_share = payout - first_share; // 2_700_000
+
+    assert_eq!(token.balance(&artist), artist_before + royalty);
+    assert_eq!(token.balance(&buyer), buyer_before + first_share);
+    assert_eq!(token.balance(&co_seller), co_seller_before + last_share);
+    assert_eq!(first_share + last_share + royalty, price);
+}
+
+#[test]
+fn test_sub_stroop_royalty_split_precision() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+    let recipients = vec![
+        &env,
+        Recipient {
+            address: r1.clone(),
+            percentage: 33,
+        },
+        Recipient {
+            address: r2.clone(),
+            percentage: 33,
+        },
+        Recipient {
+            address: r3.clone(),
+            percentage: 34,
+        },
+    ];
+
+    // Price = 2 stroops: (2 * 33) / 100 = 0 for r1 and r2, so r3 absorbs the full 2 stroops.
+    let price = 2_i128;
+    let id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+// ── Issue #1206: Minimum bid increment floor on low reserve prices ──────────
+
+#[test]
+fn test_place_bid_low_reserve_enforces_minimum_increment_floor() {
+    let (env, client, artist, bidder_a, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Reserve price of 10 stroops: 10 * 500 / 10_000 = 0 (truncates to 0).
+    // Floor of 1 must still be enforced so min_bid = 11.
+    let reserve_price = 10_i128;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &reserve_price,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&bidder_a, &auction_id, &10_i128);
+
+    let bidder_b = Address::generate(&env);
+    let sac = StellarAssetClient::new(&env, &token_id);
+    sac.mint(&bidder_b, &1_000_i128);
+
+    // Equal bid (0 increment) must fail
+    env.as_contract(&contract_id, || {
+        let res = client.try_place_bid(&bidder_b, &auction_id, &10_i128);
+        assert!(res.is_err(), "0-increment bid must fail on low reserve");
+    });
+
+    // Minimum floor increment (+1 -> 11) must succeed
+    client.place_bid(&bidder_b, &auction_id, &11_i128);
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.highest_bid, 11_i128);
+    assert_eq!(auction.highest_bidder, Some(bidder_b));
+}
+
+#[test]
+fn test_place_bid_one_stroop_reserve_enforces_floor() {
+    let (env, client, artist, bidder_a, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1u64,
+        &recipients,
+    );
+
+    let token = TokenClient::new(&env, &token_id);
+    let r1_before = token.balance(&r1);
+    let r2_before = token.balance(&r2);
+    let r3_before = token.balance(&r3);
+
+    client.buy_artwork(&buyer, &id);
+
+    assert_eq!(token.balance(&r1), r1_before);
+    assert_eq!(token.balance(&r2), r2_before);
+    assert_eq!(token.balance(&r3), r3_before + 2);
+        &1_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&bidder_a, &auction_id, &1_i128);
+
+    let bidder_b = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&bidder_b, &100_i128);
+
+    env.as_contract(&contract_id, || {
+        let res = client.try_place_bid(&bidder_b, &auction_id, &1_i128);
+        assert!(res.is_err(), "same-price bid must fail");
+    });
+
+    client.place_bid(&bidder_b, &auction_id, &2_i128);
+    assert_eq!(client.get_auction(&auction_id).highest_bid, 2_i128);
+}

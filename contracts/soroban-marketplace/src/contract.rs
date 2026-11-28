@@ -31,8 +31,11 @@ use crate::{
 #[contract]
 pub struct MarketplaceContract;
 
-const MIN_DURATION_SECONDS: u64 = 60;
-const MAX_DURATION_SECONDS: u64 = 30 * 86_400;
+pub const MIN_DURATION_SECONDS: u64 = 60;
+pub const MAX_AUCTION_DURATION: u64 = 30 * 86_400; // 30 days / 2,592,000 seconds
+pub const MAX_DURATION_SECONDS: u64 = MAX_AUCTION_DURATION;
+pub const MIN_BID_INCREMENT_BPS: i128 = 500; // 5%
+pub const MIN_BID_INCREMENT_FLOOR: i128 = 1;
 
 #[contractimpl]
 impl MarketplaceContract {
@@ -253,6 +256,13 @@ impl MarketplaceContract {
         }
         if price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+
+        if amount == 0 {
+            panic_with_error!(&env, MarketplaceError::InvalidAmount);
+        }
+        if amount != 1 && Self::is_erc721_collection(&env, &collection, token_id) {
+            panic_with_error!(&env, MarketplaceError::InvalidAmount);
         }
 
         let recipients_len = recipients.len();
@@ -616,17 +626,23 @@ impl MarketplaceContract {
         }
 
         // Enforce minimum bid increment to prevent griefing.
-        // If there's an existing bid, the new bid must be strictly greater than
-        // the current highest bid AND at least 5% higher. Otherwise, it must
-        // meet the reserve price.
+        // If there's an existing bid, the new bid must exceed the current highest
+        // bid by at least max((highest_bid * MIN_BID_INCREMENT_BPS) / 10_000, MIN_BID_INCREMENT_FLOOR).
+        // Otherwise, it must meet the reserve price.
         let min_bid = if auction.highest_bid > 0 {
-            auction.highest_bid + (auction.highest_bid * 5 / 100)
+            let pct_increment = auction
+                .highest_bid
+                .checked_mul(MIN_BID_INCREMENT_BPS)
+                .map(|v| v / 10_000)
+                .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::BidTooLow));
+            let min_increment = pct_increment.max(MIN_BID_INCREMENT_FLOOR);
+            auction
+                .highest_bid
+                .checked_add(min_increment)
+                .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::BidTooLow))
         } else {
             auction.reserve_price
         };
-        // The `amount <= auction.highest_bid` guard closes the griefing gap where
-        // `highest_bid * 5 / 100` truncates to 0 for small bids, making
-        // `min_bid == highest_bid` and allowing a replacement at the same price.
         if amount <= auction.highest_bid || amount < min_bid {
             panic_with_error!(&env, MarketplaceError::BidTooLow)
         }
@@ -716,6 +732,47 @@ impl MarketplaceContract {
             auction_id,
             winner: finalized_winner,
             amount: finalized_amount,
+        }
+        .publish(&env);
+    }
+
+    /// Creator ends their auction early. Only allowed while the auction is
+    /// still Active, has no bids, and has not yet reached its end time.
+    pub fn cancel_auction(env: Env, creator: Address, auction_id: u64) {
+        if crate::storage::is_paused(&env) {
+            panic_with_error!(&env, MarketplaceError::ContractPaused);
+        }
+        creator.require_auth();
+
+        let mut auction = load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+
+        if auction.creator != creator {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        if auction.status == AuctionStatus::Finalized {
+            panic_with_error!(&env, MarketplaceError::AuctionAlreadyFinalized);
+        }
+        if auction.status != AuctionStatus::Active {
+            panic_with_error!(&env, MarketplaceError::AuctionNotActive);
+        }
+        // Bids are escrowed in this contract and there is no refund path here,
+        // so an auction that already has a bid must run to finalization.
+        if auction.highest_bidder.is_some() {
+            panic_with_error!(&env, MarketplaceError::AuctionHasBids);
+        }
+        if env.ledger().timestamp() >= auction.end_time {
+            panic_with_error!(&env, MarketplaceError::AuctionExpired);
+        }
+
+        // create_auction does not escrow the NFT (it moves in finalize_auction),
+        // so cancelling only needs to update the status.
+        auction.status = AuctionStatus::Cancelled;
+        save_auction(&env, &auction);
+
+        AuctionCancelledEvent {
+            auction_id,
+            creator,
         }
         .publish(&env);
     }
@@ -1057,7 +1114,7 @@ impl MarketplaceContract {
             payout -= fee;
         }
         let len = recipients.len();
-        let mut ds = 0;
+        let mut ds: i128 = 0;
         for i in 0..len {
             let r = recipients.get(i).unwrap();
             let amt = if i == len - 1 {
@@ -1065,8 +1122,11 @@ impl MarketplaceContract {
             } else {
                 (payout * r.percentage as i128) / 100
             };
-            token.transfer(&env.current_contract_address(), &r.address, &amt);
             ds += amt;
+            assert!(ds <= payout, "distributed amount exceeds payout");
+            if amt > 0 {
+                token.transfer(&env.current_contract_address(), &r.address, &amt);
+            }
         }
     }
 
